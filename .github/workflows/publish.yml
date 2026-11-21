@@ -1,0 +1,96 @@
+name: 验证并发布 ERP 镜像
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: erp-publish-main
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ERP_IMAGE: wuxu-erp:ci
+      ERP_SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: 运行本地回归测试
+        run: python3 -B -m unittest discover -s tests -v
+
+      - name: 生成本次验证所需口令
+        run: |
+          python3 - <<'PY'
+          import os
+          import secrets
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              for name in ("ERP_ADMIN_PASSWORD", "ERP_DB_PASSWORD"):
+                  value = secrets.token_urlsafe(24)
+                  print("::add-mask::" + value)
+                  print(f"{name}={value}", file=env)
+          PY
+
+      - name: 用 PostgreSQL 启动 Compose 并验证自动演示
+        run: |
+          docker compose up -d --build --wait --wait-timeout 180
+          python3 - <<'PY'
+          import http.cookiejar
+          import json
+          import os
+          import urllib.request
+
+          root = "http://127.0.0.1:8787"
+          client = urllib.request.build_opener(
+              urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+          )
+          with client.open(root + "/api/health", timeout=10) as response:
+              assert json.load(response) == {"ok": True, "db": "postgresql"}
+          credentials = json.dumps({"username": "admin", "password": os.environ["ERP_ADMIN_PASSWORD"]}).encode()
+          login = urllib.request.Request(
+              root + "/api/login", data=credentials,
+              headers={"Content-Type": "application/json"},
+          )
+          with client.open(login, timeout=10) as response:
+              assert json.load(response)["ok"]
+          with client.open(root + "/api/exercise/demo", timeout=10) as response:
+              demo = json.load(response)
+          assert demo["ref"] == "SO-SIM-001"
+          assert len(demo["events"]) == 29
+          assert demo["events"][-1]["snapshot"]["accepted"] == 30
+          assert demo["events"][-1]["snapshot"]["receivable"]["balance"] == 0
+          PY
+
+      - name: 发布镜像并用 Compose 回拉验证
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          revision="$image:sha-$GITHUB_SHA"
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null' EXIT
+          docker tag "$ERP_IMAGE" "$revision"
+          docker push "$revision"
+          ERP_IMAGE="$revision" docker compose pull app
+          ERP_IMAGE="$revision" docker compose up -d --no-build --wait --wait-timeout 180
+          docker tag "$revision" "$image:main"
+          docker push "$image:main"
+
+      - name: 启动失败时查看容器日志
+        if: failure()
+        run: docker compose logs --tail=100
+
+      - name: 停止临时容器
+        if: always()
+        run: docker compose down
