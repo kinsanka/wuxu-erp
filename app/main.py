@@ -19,6 +19,7 @@ from db import POSTGRES, initialize, transaction
 from erp import BusinessError, DEMO_CREDENTIALS, authenticate, demo_login_enabled, execute, login, require, sample_dataset, session_key
 from exercise import apply as apply_exercise, view as view_exercise
 from exercise_demo import build_demo
+from fulfillment import ORDER_ACTIONS, expedite_desk, order_desk
 from industry import OPERATIONS as INDUSTRIAL_OPERATIONS, apply as apply_industry, view as view_industry
 from practice import allowed as practice_allowed, latest as latest_practice, launch as launch_practice, view as view_practice
 from read import EXPORTS, bom_detail, document, item_detail, state, trace, walkthrough_targets
@@ -31,10 +32,11 @@ STATIC = {"/": ("index.html","text/html; charset=utf-8"), "/style.css": ("style.
           "/exercise.js": ("exercise.js","text/javascript; charset=utf-8"),
           "/exercise_demo.js": ("exercise_demo.js","text/javascript; charset=utf-8"),
           "/walkthrough.js": ("walkthrough.js","text/javascript; charset=utf-8"),
-          "/industry.js": ("industry.js","text/javascript; charset=utf-8")}
+          "/industry.js": ("industry.js","text/javascript; charset=utf-8"),
+          "/orders.js": ("orders.js","text/javascript; charset=utf-8")}
 IDEMPOTENT_ACTIONS = {
     "master","purchase","sale","approve","receive","ship","bom","work",
-    "start","report","finish","inspect","transfer","use","billing","exercise","practice", *INDUSTRIAL_OPERATIONS,
+    "start","report","finish","inspect","transfer","exercise","practice", *ORDER_ACTIONS, *INDUSTRIAL_OPERATIONS,
 }
 LOGIN_ATTEMPTS = {}
 ATTEMPT_LOCK = Lock()
@@ -62,7 +64,6 @@ def safe_csv(value):
 def csv_export(db,kind,account):
     require(kind in EXPORTS,"报表不存在",404)
     require(kind!="audit" or account["role"]=="admin","无审计导出权限",403)
-    require(kind!="clinical" or account["role"] in {"admin","clinical"},"无临床导出权限",403)
     query, columns = EXPORTS[kind]
     output=io.StringIO()
     writer=csv.writer(output)
@@ -77,6 +78,8 @@ def perform(db,action,payload,account):
         return apply_exercise(db,payload,account)
     if action=="practice":
         return launch_practice(db,account)
+    if action in ORDER_ACTIONS:
+        return ORDER_ACTIONS[action](db,payload,account)
     if action in INDUSTRIAL_OPERATIONS:
         return apply_industry(db,action,payload,account)
     return execute(db,action,payload,account)
@@ -202,6 +205,10 @@ class Handler(BaseHTTPRequestHandler):
                     result=view_exercise(db,account)
                 elif path=="/api/state":
                     result=state(db,account)
+                elif path=="/api/orders/purchase" or path=="/api/orders/sale":
+                    result=order_desk(db,path.rsplit("/",1)[-1])
+                elif path=="/api/orders/expedite" or path.startswith("/api/orders/expedite/"):
+                    result=expedite_desk(db,path.removeprefix("/api/orders/expedite").lstrip("/"))
                 elif path=="/api/walkthrough":
                     run=parse_qs(parsed.query).get("run",[""])[0]
                     result=view_practice(db,run,account) if run else dict(

@@ -15,12 +15,12 @@ ADMIN_ACCOUNT_ID = "administrator"
 LEGACY_DEMO_ACCOUNT_ID = "wuxu-demo-account"
 DEMO_CREDENTIALS = {"username": "admin", "password": "wuxu-demo"}
 ERP_ZONE = ZoneInfo(os.getenv("ERP_TIMEZONE", "Asia/Shanghai"))
-ROLES = {"admin", "planner", "warehouse", "clinical", "viewer"}
+ROLES = {"admin", "planner", "warehouse", "viewer"}
 WORKFLOW = {
     "master": {"planner"}, "purchase": {"planner"}, "sale": {"planner"}, "approve": {"planner"},
     "receive": {"warehouse"}, "ship": {"warehouse"}, "bom": {"planner"}, "work": {"planner"},
     "start": {"planner"}, "report": {"planner"}, "finish": {"planner"}, "inspect": {"warehouse"},
-    "transfer": {"warehouse", "clinical"}, "use": {"clinical"}, "billing": {"clinical"},
+    "transfer": {"warehouse"},
     "user": set(), "password": ROLES,
 }
 
@@ -124,7 +124,7 @@ def authenticate(db, token):
         "SELECT u.id,u.username,u.name,u.role FROM sessions s JOIN users u ON u.id=s.user_id "
         "WHERE s.token=%s AND s.expires>%s AND u.enabled=1", (session_key(token), int(time.time())),
     )
-    if not account or account["id"] == LEGACY_DEMO_ACCOUNT_ID:
+    if not account or account["id"] == LEGACY_DEMO_ACCOUNT_ID or account["role"] not in ROLES:
         return None
     if demo_session:
         if account["id"] != ADMIN_ACCOUNT_ID:
@@ -142,7 +142,7 @@ def login(db, data):
         account = db.one("SELECT id FROM users WHERE id=%s AND enabled=1", (ADMIN_ACCOUNT_ID,))
         require(account, "演示账号不可用", 403)
         return create_session(db, account["id"], demo=True)
-    account = db.one("SELECT id,password FROM users WHERE username=%s AND enabled=1 AND id<>%s",
+    account = db.one("SELECT id,password FROM users WHERE username=%s AND enabled=1 AND id<>%s AND role<>'clinical'",
                      (username, LEGACY_DEMO_ACCOUNT_ID))
     require(account and password_matches(password, account["password"]), "账号或密码错误", 401)
     return create_session(db, account["id"])
@@ -167,6 +167,18 @@ def audit(db, account, action, ref, detail=""):
 def lookup(db, table, ident, label):
     result = db.one(f"SELECT * FROM {table} WHERE id=%s", (ident,))
     require(result is not None, f"{label}不存在", 404)
+    if table=="sites":
+        require(result["type"]=="factory",f"{label}不存在",404)
+    if table=="items":
+        require(result["type"]!="medical",f"{label}不存在",404)
+    if table=="partners":
+        require(ident!="medicalvendor",f"{label}不存在",404)
+    if table=="lots":
+        lookup(db,"items",result["item_id"],"物料")
+    if table=="documents":
+        lookup(db,"sites",result["site_id"],"仓库")
+        require(not db.one("SELECT 1 FROM document_lines l JOIN items i ON i.id=l.item_id "
+                           "WHERE l.doc_id=%s AND i.type='medical'",(ident,)),f"{label}不存在",404)
     return result
 
 
@@ -189,17 +201,17 @@ def master(db, data, account):
     ident = key()
     unique(db, entity, code)
     if entity == "items":
-        category = choice(data, "type", "物料分类", {"material", "product", "medical"})
+        category = choice(data, "type", "物料分类", {"material", "product"})
         gtin = field(data, "gtin", "GTIN", 14, True)
         tracked = int(data.get("tracked") is True)
-        require(not tracked or category == "medical", "一码一物仅支持医疗耗材")
+        require(not tracked, "工业物料按批次管理")
         if gtin:
             require(re.fullmatch(r"[0-9]{14}", gtin) and sum(int(n) * (3 if i % 2 else 1) for i, n in enumerate(reversed(gtin))) % 10 == 0, "GTIN 须为校验通过的 14 位编号")
             require(not db.one("SELECT id FROM items WHERE gtin=%s", (gtin,)), "GTIN 已绑定其他物料", 409)
         db.execute("INSERT INTO items VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                    (ident, code, name, category, field(data,"unit","单位",12), scaled(data,"minimum","补货点",zero=True), int(data.get("quality") is True), tracked, gtin))
     elif entity == "sites":
-        category = choice(data, "type", "仓库分类", {"factory", "central", "clinical"})
+        category = choice(data, "type", "仓库分类", {"factory"})
         db.execute("INSERT INTO sites VALUES (%s,%s,%s,%s)", (ident, code, name, category))
     else:
         category = choice(data, "type", "往来类型", {"vendor", "customer", "both"})
@@ -211,7 +223,6 @@ def master(db, data, account):
 def create_trade(db, data, account, kind):
     site = get(db, "sites", data, "site_id", "仓库")
     partner = get(db, "partners", data, "partner_id", "往来单位")
-    require(site["type"] != "clinical", "采购或销售请使用工厂仓或中心库")
     require(partner["type"] in ("both", "vendor" if kind == "purchase" else "customer"), "往来单位类型不适用")
     ident, ref = key(), new_ref("PO" if kind == "purchase" else "SO")
     db.execute("INSERT INTO documents VALUES (%s,%s,%s,'draft',%s,%s,NULL,%s,%s,%s)",
@@ -220,7 +231,7 @@ def create_trade(db, data, account, kind):
     for row in rows(data, "lines"):
         item = get(db, "items", row, "item_id", "物料")
         require(item["id"] not in seen, "同一单据中物料不可重复")
-        require(kind != "sale" or not item["tracked"], "一码一物耗材请通过临床耗用流程出库")
+        require(kind != "sale" or not item["tracked"], "当前物料需要专用序列号出库流程")
         qty = scaled(row, "quantity", "数量")
         require(not item["tracked"] or qty % 1000 == 0, "一码一物数量须为整数")
         db.execute("INSERT INTO document_lines VALUES (%s,%s,%s,%s,0,%s)",
@@ -342,7 +353,6 @@ def complete_trade(db, data, account, kind):
     if kind == "purchase":
         lot_code = field(data, "lot", "批号", 64)
         expiry = date_field(data, "expiry", "效期")
-        require(item["type"] != "medical" or expiry, "医疗耗材必须登记效期")
         require(not expiry or expiry >= today(), "禁止收货已过效期物料")
         lot = new_lot(db, item, lot_code, expiry, pending=bool(item["quality"]))
         if item["tracked"]:
@@ -379,7 +389,7 @@ def create_bom(db, data, account):
     seen = set()
     for row in rows(data, "lines"):
         component = get(db, "items", row, "item_id", "组件")
-        require(component["id"] != item["id"] and not component["tracked"], "组件不能为本成品或一码一物耗材")
+        require(component["id"] != item["id"] and not component["tracked"], "组件不能为本成品或序列号物料")
         require(component["id"] not in seen, "BOM 组件不可重复")
         db.execute("INSERT INTO bom_lines VALUES (%s,%s,%s,%s)", (key(), ident, component["id"], scaled(row,"quantity","单位用量")))
         seen.add(component["id"])
@@ -415,6 +425,11 @@ def plan(db, doc):
     line = db.one("SELECT * FROM document_lines WHERE doc_id=%s", (doc["id"],))
     current = today()
     supply = {}
+    linked_drafts = {row["item_id"]:row["quantity"] for row in db.all(
+        "SELECT l.item_id,SUM(l.quantity) AS quantity FROM supply_links k JOIN documents d ON d.id=k.supply_id "
+        "JOIN document_lines l ON l.doc_id=d.id WHERE k.demand_id=%s AND d.kind='purchase' "
+        "AND d.status='draft' GROUP BY l.item_id",(doc["id"],),
+    )}
     for purchase in db.all(
         "SELECT d.id,d.ref,d.due,p.name AS supplier,l.item_id,l.quantity-l.fulfilled AS remaining "
         "FROM documents d JOIN document_lines l ON l.doc_id=d.id JOIN bom_lines b ON b.item_id=l.item_id "
@@ -433,7 +448,7 @@ def plan(db, doc):
         purchases = supply.get(row["item_id"], [])
         incoming = sum(purchase["remaining"] for purchase in purchases if purchase["schedule"]=="scheduled")
         row.update(available=site_stock, incoming=incoming, shortage=max(0,row["required"]-site_stock),
-                   net=max(0,row["required"]-site_stock-incoming), purchases=purchases)
+                   net=max(0,row["required"]-site_stock-incoming), draft=int(linked_drafts.get(row["item_id"],0)),purchases=purchases)
         result.append(row)
     return result
 
@@ -522,16 +537,11 @@ def transfer(db,data,account):
         lot = lookup(db,"lots",unit["lot_id"],"批次")
         quantity = 1000
     else:
-        require(account["role"] != "clinical", "临床角色请使用包装码调拨", 403)
         lot = get(db,"lots",data,"lot_id","批次")
         item = lookup(db,"items",lot["item_id"],"物料")
-        require(not item["tracked"], "一码一物耗材必须逐件使用包装码调拨")
+        require(not item["tracked"], "序列号物料必须逐件扫描调拨")
         quantity = scaled(data,"quantity","调拨数量")
-    if account["role"] == "clinical":
-        require("clinical" in (source["type"],target["type"]), "临床调拨需涉及二级库", 403)
     ref = new_ref("TR")
-    item = lookup(db,"items",lot["item_id"],"物料")
-    require("clinical" not in (source["type"],target["type"]) or item["type"] == "medical", "二级库仅允许医疗耗材")
     active_lot(lot)
     detail = f"{source['code']} → {target['code']}" + (f" / {unit['code']}" if scan else "")
     post(db,lot["id"],source["id"],-quantity,"调拨出库",ref,account,detail)
@@ -540,34 +550,6 @@ def transfer(db,data,account):
         db.execute("UPDATE units SET site_id=%s WHERE id=%s", (target["id"],unit["id"]))
     audit(db,account,"仓库调拨",ref,detail)
     return {"ref": ref}
-
-
-def use_medical(db,data,account):
-    unit = find_unit(db,field(data,"code","包装码",220))
-    require(unit and unit["status"] == "stock", "包装码未登记或已经耗用", 409)
-    site = lookup(db,"sites",unit["site_id"],"仓库")
-    require(site["type"] == "clinical", "耗材须先调拨到临床二级库")
-    lot = lookup(db,"lots",unit["lot_id"],"批次")
-    active_lot(lot)
-    case_ref = field(data,"case_ref","手术/业务号",80)
-    ref = new_ref("USE")
-    post(db,lot["id"],site["id"],-1000,"临床耗用",ref,account,unit["code"])
-    db.execute("UPDATE units SET site_id=NULL,status='used' WHERE id=%s", (unit["id"],))
-    db.execute("INSERT INTO clinical VALUES (%s,%s,%s,%s,%s,'pending',NULL,%s,%s,NULL)",
-               (key(),ref,unit["id"],site["id"],case_ref,note(data),now()))
-    audit(db,account,"临床耗用",ref,unit["code"])
-    return {"ref": ref}
-
-
-def billing(db,data,account):
-    record = get(db,"clinical",data,"id","耗用记录")
-    decision = choice(data,"decision","计费状态",{"confirmed","rejected"})
-    require(record["status"] != "confirmed" and record["status"] != decision,"计费已确认或状态未变化",409)
-    external = field(data,"billing_ref","费用回执",100,optional=decision=="rejected")
-    comment = field(data,"note","原因",400,optional=decision=="confirmed")
-    db.execute("UPDATE clinical SET status=%s,billing_ref=%s,billed=%s WHERE id=%s",(decision,external or None,now(),record["id"]))
-    audit(db,account,"确认计费" if decision=="confirmed" else "计费退回",record["ref"],external or comment)
-    return {"ref": record["ref"]}
 
 
 def create_user(db,data,account):
@@ -600,7 +582,7 @@ ACTIONS = {
     "sale":lambda d,v,u:create_trade(d,v,u,"sale"), "approve":approve,
     "receive":lambda d,v,u:complete_trade(d,v,u,"purchase"), "ship":lambda d,v,u:complete_trade(d,v,u,"sale"),
     "bom":create_bom, "work":create_work, "start":start_work, "report":report_work,
-    "finish":finish_work, "inspect":inspect, "transfer":transfer, "use":use_medical, "billing":billing,
+    "finish":finish_work, "inspect":inspect, "transfer":transfer,
     "user":create_user,"password":change_password,
 }
 

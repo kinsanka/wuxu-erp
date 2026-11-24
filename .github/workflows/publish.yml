@@ -42,10 +42,11 @@ jobs:
                   print(f"{name}={value}", file=env)
           PY
 
-      - name: 用 PostgreSQL 启动 Compose 并验证自动演示
+      - name: 用 PostgreSQL 验证工业业务与急单
         run: |
           docker compose up -d --build --wait --wait-timeout 180
           python3 - <<'PY'
+          from datetime import date, timedelta
           import http.cookiejar
           import json
           import urllib.request
@@ -70,15 +71,23 @@ jobs:
               assert response.headers["Cache-Control"] == "no-store"
               assert json.load(response) == {"ok": True}
           with client.open(root + "/api/state", timeout=10) as response:
-              assert json.load(response)["account"]["is_demo"]
+              state = json.load(response)
+          assert state["account"]["is_demo"]
+          assert state["sites"] and all(row["type"] == "factory" for row in state["sites"])
+          assert state["items"] and all(row["type"] in {"material", "product"} for row in state["items"])
           with client.open(root + "/api/walkthrough", timeout=10) as response:
               assert json.load(response)["practice_allowed"]
-          with client.open(root + "/api/exercise/demo", timeout=10) as response:
-              demo = json.load(response)
-          assert demo["ref"] == "SO-SIM-001"
-          assert len(demo["events"]) == 29
-          assert demo["events"][-1]["snapshot"]["accepted"] == 30
-          assert demo["events"][-1]["snapshot"]["receivable"]["balance"] == 0
+          order = next(row for row in state["documents"] if row["kind"] == "sale")
+          payload = {"id": order["id"], "operation": "schedule", "priority": "critical",
+                     "owner": "发布验证", "due": (date.fromisoformat(state["today"]) + timedelta(days=1)).isoformat(),
+                     "note": "验证原销售单急单跟进"}
+          expedite = urllib.request.Request(root + "/api/action/expedite", data=json.dumps(payload).encode(),
+                                           headers={"Content-Type": "application/json"})
+          with client.open(expedite, timeout=10) as response:
+              assert json.load(response)["id"] == order["id"]
+          with client.open(root + "/api/orders/expedite/" + order["id"], timeout=10) as response:
+              desk = json.load(response)
+          assert desk["ticket"]["priority"] == "critical" and desk["work"] and desk["events"]
           PY
 
       - name: 发布镜像并用 Compose 回拉验证

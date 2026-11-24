@@ -70,7 +70,8 @@ def assign_step(db,payload,account):
     return {"ref":work["ref"]}
 
 
-UNREGISTERED = (" FROM movements m JOIN documents d ON d.ref=m.ref WHERE m.kind='销售发货' "
+UNREGISTERED = (" FROM movements m JOIN documents d ON d.ref=m.ref "
+                "JOIN sites s ON s.id=d.site_id WHERE s.type='factory' AND m.kind='销售发货' "
                 "AND d.kind='sale' AND m.quantity<0 AND NOT EXISTS "
                 "(SELECT 1 FROM shipment_movements sm WHERE sm.movement_id=m.id)")
 
@@ -116,7 +117,7 @@ SELECT dl.id AS line_id,d.id AS doc_id,d.ref AS doc_ref,d.kind,p.name AS partner
 FROM document_lines dl JOIN documents d ON d.id=dl.doc_id JOIN sites s ON s.id=d.site_id
 JOIN items i ON i.id=dl.item_id LEFT JOIN partners p ON p.id=d.partner_id
 LEFT JOIN qualified q ON q.ref=d.ref AND q.item_id=dl.item_id LEFT JOIN invoiced v ON v.line_id=dl.id
-WHERE d.kind IN ('sale','purchase') AND s.type='factory' AND d.status IN ('partial','done') AND dl.price>0"""
+WHERE d.kind IN ('sale','purchase') AND s.type='factory' AND i.type<>'medical' AND d.status IN ('partial','done') AND dl.price>0"""
 
 
 def return_purchase(db,payload,account):

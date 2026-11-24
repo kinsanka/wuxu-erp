@@ -127,6 +127,9 @@ async function moveWalkthrough(index) {
     }
     if (walkthrough!==session) return;
     session.index = index;
+    if (step.page==="purchase"||step.page==="sale") orderTabs[step.page]="orders";
+    if (step.page==="transport") industryTabs.transport="all";
+    if (step.page==="finance") industryTabs.finance=step.document==="sale"?"ar":step.document==="purchase"?"ap":"all";
     const {batch, product, raw, sale, worker_code} = session.targets;
     if (step.page==="master") masterTab = "items";
     if (step.page==="work") workTab = "docs";
@@ -147,7 +150,7 @@ async function moveWalkthrough(index) {
     if (id) await openDocument(id,isCurrent);
     if (step.page==="master" && product) await itemDetail(product.id,isCurrent);
     if (step.page==="trace" && batch) await searchTrace({lot:batch.id},isCurrent);
-    if (Object.hasOwn(industryRoles,step.page)) await loadIndustry(step.page);
+    await syncPageData();
   } finally {
     if (walkthrough===session) {
       session.loading = false;
@@ -167,6 +170,6 @@ const walkthroughHandlers = {
   },
   walkthroughEnd: ()=>{
     endWalkthrough();
-    if (page==="home" || page==="exercise") render();
+    render();
   },
 };

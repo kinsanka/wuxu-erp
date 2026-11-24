@@ -174,6 +174,6 @@ class ExerciseTests(unittest.TestCase):
         self.assertTrue(self.model["ap"]["posted"])
         self.assertEqual(self.model["ap"]["invoiced"],18)
         after=self.call("/api/state")
-        for collection in ("stock","documents","clinical"):
+        for collection in ("stock","documents","movements"):
             self.assertEqual(after[collection],before[collection])
 

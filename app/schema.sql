@@ -171,3 +171,21 @@ CREATE TABLE IF NOT EXISTS practice_runs (
   created TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS practice_runs_user_idx ON practice_runs(user_id,created);
+CREATE TABLE IF NOT EXISTS expedite_orders (
+  doc_id TEXT PRIMARY KEY REFERENCES documents(id),
+  priority TEXT NOT NULL CHECK(priority IN ('urgent','critical')),
+  due TEXT NOT NULL, owner TEXT NOT NULL, reason TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('open','closed','cancelled')),
+  updated TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS expedite_events (
+  id TEXT PRIMARY KEY, doc_id TEXT NOT NULL REFERENCES expedite_orders(doc_id),
+  action TEXT NOT NULL, note TEXT NOT NULL, actor TEXT NOT NULL, created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS expedite_events_order ON expedite_events(doc_id,created);
+CREATE TABLE IF NOT EXISTS delivery_revisions (
+  id TEXT PRIMARY KEY, doc_id TEXT NOT NULL REFERENCES documents(id),
+  previous_due TEXT, new_due TEXT NOT NULL, reason TEXT NOT NULL,
+  actor TEXT NOT NULL, created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS delivery_revisions_order ON delivery_revisions(doc_id,created);

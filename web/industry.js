@@ -3,6 +3,7 @@
 const industryRoles = {transport:["warehouse"], people:["planner"], finance:[],counts:["warehouse"]};
 const industryTitles = {transport:"运输与签收", people:"人员与工时", finance:"应收应付", counts:"库存盘点"};
 const industryViews = {};
+const industryTabs = {transport:"all",finance:"all"};
 const tradeMoney = cents=>numeric(money.format(cents/100));
 const unitQuantity = (value,unit)=>numeric(qty(value)+" "+unit);
 const financeDirection = {ar:"应收", ap:"应付"};
@@ -28,20 +29,27 @@ function industryMetrics(metrics) {
 }
 
 function industrySections(placeholder,content) {
-  return `<div class="stack"><section class="panel">${filters({placeholder})}</section><div id="filtered" class="stack">${content}</div></div>`;
+  const choices={
+    transport:[["all","全部"],["pending","待登记运单"],["transit","在途"],["overdue","签收逾期"],["signed","已签收"]],
+    finance:[["all","全部"],["ar","销售应收"],["ap","采购应付"],["payments","收款与付款"]],
+  }[page];
+  return `<div class="stack"><section class="panel">${choices?tabs("industryTab",industryTabs[page],choices):""}
+    ${filters({placeholder})}</section><div id="filtered" class="stack">${content}</div></div>`;
 }
 
 function transportPage(view) {
+  const selected=industryTabs.transport;
+  const matchesStatus=row=>selected==="all"||(selected==="signed"?!!row.signed:!row.signed&&(selected==="transit"||row.due<state.today));
   return head(industryTitles.transport,"把已发生的出库流水登记到运单，跟踪预计到货和签收凭证。")
     +industryMetrics([["待登记销售单",view.pending.length],["在途运单",view.shipments.filter(row=>!row.signed).length],
       ["签收逾期",view.shipments.filter(row=>!row.signed&&row.due<state.today).length]])
-    +industrySections("搜索销售单、运单、客户或承运商",panel("待登记运单",table(["销售单","待登记发货流水","操作"],view.pending.filter(row=>matches(row.ref)),row=>[
+    +industrySections("搜索销售单、运单、客户或承运商",(["all","pending"].includes(selected)?panel("待登记运单",table(["销售单","待登记发货流水","操作"],view.pending.filter(row=>matches(row.ref)),row=>[
       link(row.ref,"document",row.id),numeric(row.batches),button("登记运单","dispatch",row.id,"small"),
-    ]))+panel("运输跟踪",table(["运单／物流单号","原销售单","客户","承运商","预计签收","状态","操作"],
-      view.shipments.filter(row=>matches(row.ref,row.tracking,row.doc_ref,row.customer,row.carrier,row.receipt)),row=>[
+    ])):"")+(selected==="pending"?"":panel("运输跟踪",table(["运单／物流单号","原销售单","客户","承运商","预计签收","状态","操作"],
+      view.shipments.filter(row=>matchesStatus(row)&&matches(row.ref,row.tracking,row.doc_ref,row.customer,row.carrier,row.receipt)),row=>[
       link(row.ref,"shipmentDetail",row.id)+sub(row.tracking),link(row.doc_ref,"document",row.doc_id),text(row.customer),
       text(row.carrier),text(row.due),shipmentStatus(row),row.signed?clean(row.receipt):button("登记签收","signShipment",row.id,"small"),
-    ])));
+    ]))));
 }
 
 function peoplePage(view) {
@@ -63,6 +71,7 @@ function peoplePage(view) {
 }
 
 function financePage(view) {
+  const selected=industryTabs.finance;
   const balance = direction=>view.invoices.filter(row=>row.direction===direction).reduce((total,row)=>total+row.amount-row.settled,0);
   const status={cleared:["已结清","green"], overdue:["已逾期","red"], partial:["部分核销","amber"], open:["待核销","blue"]};
   const pending = (heading,kind)=>panel(heading,table(["原单据","物料","已满足数量","已开票","可开票","单价","操作"],
@@ -74,20 +83,21 @@ function financePage(view) {
   return head(industryTitles.finance,"按签收数量或合格收货数量登记发票，以收付款凭证分次核销。")
     +industryMetrics([["台账应收余额",money.format(balance("ar")/100)],["台账应付余额",money.format(balance("ap")/100)],
       ["台账逾期发票",view.invoices.filter(row=>row.amount>row.settled&&row.due<state.today).length]])
-    +industrySections("搜索发票、原单据或往来单位",pending("销售 · 已签收待开票","sale")+pending("采购 · 合格收货待核票","purchase")
-      +panel("应收与应付台账",table(["发票","方向","原单据","发票金额","已核销","未结余额","到期日","状态","操作"],
-        view.invoices.filter(row=>matches(row.ref,row.doc_ref,row.partner,financeDirection[row.direction])),row=>[
+    +industrySections("搜索发票、原单据或往来单位",(["all","ar"].includes(selected)?pending("销售 · 已签收待开票","sale"):"")
+      +(["all","ap"].includes(selected)?pending("采购 · 合格收货待核票","purchase"):"")
+      +(selected==="payments"?"":panel("应收与应付台账",table(["发票","方向","原单据","发票金额","已核销","未结余额","到期日","状态","操作"],
+        view.invoices.filter(row=>(selected==="all"||row.direction===selected)&&matches(row.ref,row.doc_ref,row.partner,financeDirection[row.direction])),row=>[
         link(row.ref,"invoiceDetail",row.id)+sub(row.partner),text(financeDirection[row.direction]),link(row.doc_ref,"document",row.doc_id),
         tradeMoney(row.amount),tradeMoney(row.settled),tradeMoney(row.amount-row.settled),text(row.due),
         cfgLabel(status,row.amount===row.settled?"cleared":row.due<state.today?"overdue":row.settled?"partial":"open"),
         row.amount>row.settled?`<div class="actions">${button(row.direction==="ar"?"登记收款单":"登记付款单","registerPayment",row.id,"small")}
           ${button("核销","settleInvoice",row.id,"small")}</div>`:"—",
-      ]),"","显示最近 300 张发票。")+panel("收款单与付款单",table(["凭证编号","方向","往来单位","实际金额","已核销","可核销余额","收付款日期"],
+      ]),"","显示最近 300 张发票。"))+(["all","payments"].includes(selected)?panel("收款单与付款单",table(["凭证编号","方向","往来单位","实际金额","已核销","可核销余额","收付款日期"],
         view.payments.filter(row=>matches(row.ref,row.partner,financeDirection[row.direction],
           ...view.invoices.filter(invoice=>invoice.direction===row.direction&&invoice.partner_id===row.partner_id).map(invoice=>invoice.doc_ref))),row=>[
           code(row.ref),text(row.direction==="ar"?"收款单":"付款单"),text(row.partner),tradeMoney(row.amount),tradeMoney(row.allocated),
           tradeMoney(row.amount-row.allocated),text(row.transacted),
-        ])));
+        ])):""));
 }
 
 function countsPage(rows) {

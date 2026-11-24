@@ -196,6 +196,8 @@ dialog::backdrop { background: #10252099; }
   .cover-copy p { margin-top: 14px; font-size: 13px; }
 }
 @media (max-width: 420px) {
+  .top-actions { gap: 6px; }
+  #mode { display: none; }
   .form-grid { grid-template-columns: minmax(0,1fr); }
   .form-grid .span-2 { grid-column: auto; }
   .edit-row, .edit-row.bom, .edit-row.step { grid-template-columns: 1fr 1fr auto; }

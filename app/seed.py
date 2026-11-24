@@ -11,6 +11,11 @@ ADMIN={"id":ADMIN_ACCOUNT_ID,"username":"admin","name":"系统管理员","role":
 def bootstrap(db):
     current=db.one("SELECT value FROM settings WHERE key='demo'")
     if current:
+        if current["value"]=="1" and not db.one("SELECT value FROM settings WHERE key='industrial_catalog_v1'"):
+            db.execute("INSERT INTO sites VALUES ('finished','F02','成品周转仓','factory') ON CONFLICT DO NOTHING")
+            db.execute("INSERT INTO items VALUES ('guide','MAT-004','直线导轨组件','material','件',6000,1,0,'') "
+                       "ON CONFLICT DO NOTHING")
+            db.execute("INSERT INTO settings VALUES ('industrial_catalog_v1','1')")
         return
     db.execute("INSERT INTO settings VALUES ('demo',%s)",(str(int(SEED_EXAMPLES)),))
     password=os.getenv("ERP_ADMIN_PASSWORD","").strip()
@@ -26,12 +31,12 @@ def bootstrap(db):
                (ADMIN["id"],ADMIN["username"],ADMIN["name"],password_hash(password),ADMIN["role"]))
     for ident,code,name,kind in (
         ("factory","F01","工厂物料仓","factory"),
-        ("central","H01","医院耗材中心库","central"),
-        ("clinical","H02","手术室二级库","clinical"),
+        ("finished","F02","成品周转仓","factory"),
     ):
         db.execute("INSERT INTO sites VALUES (%s,%s,%s,%s)",(ident,code,name,kind))
     if SEED_EXAMPLES:
         seed_demo(db)
+        db.execute("INSERT INTO settings VALUES ('industrial_catalog_v1','1')")
 
 
 def seed_demo(db):
@@ -42,15 +47,13 @@ def seed_demo(db):
         return (date.fromisoformat(today())+timedelta(days=days)).isoformat()
 
     db.execute("INSERT INTO partners VALUES ('vendor','V001','华源工业材料（演示）','vendor',''),"
-               "('medicalvendor','V002','新程医疗供应（演示）','vendor',''),"
                "('customer','C001','海沐电器装配（演示）','customer','')")
     for row in (
         ("al","MAT-001","铝合金胚料","material","kg",40000,0,0,""),
         ("screw","MAT-002","M6 紧固螺钉","material","件",120000,0,0,""),
         ("bearing","MAT-003","精密轴承","material","件",18000,1,0,""),
         ("module","FG-001","伺服支架组件","product","套",5000,1,0,""),
-        ("anchor","MED-001","骨科缝线锚钉","medical","盒",5000,1,1,"06912345678902"),
-        ("kit","MED-002","手术无菌耗材包","medical","包",10000,0,1,""),
+        ("guide","MAT-004","直线导轨组件","material","件",6000,1,0,""),
     ):
         db.execute("INSERT INTO items VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",row)
 
@@ -65,19 +68,13 @@ def seed_demo(db):
         action("receive",id=doc,line_id=line["id"],quantity=quantity,lot=lot,expiry=expiry,codes=codes)
         return db.one("SELECT id FROM lots WHERE item_id=%s AND code=%s",(item,lot))["id"]
 
-    industrial=purchase("vendor","factory",[("al","96","32.40"),("screw","240","0.85"),("bearing","40","23.30")])
+    industrial=purchase("vendor","factory",[("al","96","32.40"),("screw","240","0.85"),("bearing","40","23.30"),("guide","12","74.50")])
     receive(industrial,"al","AL-DEMO-01","48")
     receive(industrial,"screw","SC-DEMO-01","160")
     bearing=receive(industrial,"bearing","BR-DEMO-01","20")
     action("inspect",lot_id=bearing,verdict="released",note="演示来料尺寸检验通过")
 
-    medical=purchase("medicalvendor","central",[("anchor","6","380.00"),("kit","5","48.00")])
-    anchor=receive(medical,"anchor","ANCH-DEMO-A","6",date_ahead(42),"\n".join(f"SPD-A{i:03}" for i in range(1,7)))
-    receive(medical,"kit","KIT-DEMO-B","5",date_ahead(320),"\n".join(f"SPD-K{i:03}" for i in range(1,6)))
-    action("inspect",lot_id=anchor,verdict="released",note="演示包装与效期检查通过")
-    for code in ("SPD-A001","SPD-A002","SPD-A003"):
-        action("transfer",from_id="central",to_id="clinical",code=code)
-    action("use",code="SPD-A001",case_ref="OR-DEMO-2401",note="演示耗用，等待回执")
+    receive(industrial,"guide","GR-DEMO-01","6")
 
     bom=action("bom",item_id="module",version="A.01",lines=[
         {"item_id":"al","quantity":"2.250"},{"item_id":"screw","quantity":"6"},{"item_id":"bearing","quantity":"1"}],

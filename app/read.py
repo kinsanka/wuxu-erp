@@ -4,15 +4,25 @@ DOCUMENTS = ("SELECT d.*,s.name AS site_name,p.name AS partner_name,b.version,"
              " (SELECT COUNT(*) FROM document_lines x WHERE x.doc_id=d.id) AS line_count"
              " FROM documents d JOIN sites s ON s.id=d.site_id LEFT JOIN partners p ON p.id=d.partner_id"
              " LEFT JOIN boms b ON b.id=d.bom_id")
+INDUSTRIAL_DOCUMENT = ("s.type='factory' AND NOT EXISTS (SELECT 1 FROM document_lines dl "
+                       "JOIN items di ON di.id=dl.item_id WHERE dl.doc_id=d.id AND di.type='medical')")
 
 STOCK = ("SELECT st.quantity,l.id AS lot_id,l.code AS lot,l.expiry,l.status,s.id AS site_id,s.name AS site_name,"
          " i.id AS item_id,i.code,i.name,i.unit,i.type,i.tracked"
          " FROM stock st JOIN lots l ON l.id=st.lot_id JOIN sites s ON s.id=st.site_id"
-         " JOIN items i ON i.id=l.item_id WHERE st.quantity>0")
+         " JOIN items i ON i.id=l.item_id WHERE st.quantity>0 AND s.type='factory' AND i.type<>'medical'")
 
 MOVEMENTS = ("SELECT m.*,l.code AS lot,l.status AS lot_status,l.expiry,i.code AS item_code,i.name AS item_name,i.unit,"
              " s.name AS site_name,d.id AS doc_id FROM movements m JOIN lots l ON l.id=m.lot_id"
              " JOIN items i ON i.id=l.item_id JOIN sites s ON s.id=m.site_id LEFT JOIN documents d ON d.ref=m.ref")
+INDUSTRIAL_MOVEMENT = "s.type='factory' AND i.type<>'medical'"
+INDUSTRIAL_AUDIT = (
+    "SELECT a.* FROM audit a WHERE a.action NOT IN ('临床耗用','耗材对账') AND NOT EXISTS ("
+    "SELECT 1 FROM documents d JOIN sites s ON s.id=d.site_id WHERE d.ref=a.ref AND s.type<>'factory') "
+    "AND NOT EXISTS (SELECT 1 FROM lots l JOIN items i ON i.id=l.item_id WHERE l.code=a.ref AND i.type='medical') "
+    "AND NOT EXISTS (SELECT 1 FROM clinical c WHERE c.ref=a.ref) "
+    "AND NOT EXISTS (SELECT 1 FROM movements m JOIN sites s ON s.id=m.site_id WHERE m.ref=a.ref AND s.type<>'factory')"
+)
 
 
 def summary(db):
@@ -29,53 +39,52 @@ def summary(db):
             if row["days_left"] <= 60:
                 expiry.append(row)
     low = []
-    for item in db.all("SELECT * FROM items WHERE minimum>0 ORDER BY code"):
+    for item in db.all("SELECT * FROM items WHERE minimum>0 AND type<>'medical' ORDER BY code"):
         value = by_item.get(item["id"],0)
         if value < item["minimum"]:
             low.append(dict(item, available=value))
-    groups = db.all("SELECT kind,COUNT(*) AS count FROM documents WHERE status IN ('approved','partial','running') GROUP BY kind")
-    factory_open = " WHERE s.type='factory' AND d.status IN ('approved','partial','running')"
+    factory_open = " WHERE "+INDUSTRIAL_DOCUMENT+" AND d.status IN ('approved','partial','running')"
     factory_counts = db.all("SELECT d.kind,COUNT(*) AS count FROM documents d JOIN sites s ON s.id=d.site_id"
                             +factory_open+" GROUP BY d.kind")
     factory_pending = db.one("SELECT COUNT(DISTINCT l.id) AS n FROM lots l JOIN stock st ON st.lot_id=l.id "
-                             "JOIN sites s ON s.id=st.site_id WHERE s.type='factory' AND st.quantity>0 AND l.status='pending'")["n"]
+                             "JOIN sites s ON s.id=st.site_id JOIN items i ON i.id=l.item_id "
+                             "WHERE s.type='factory' AND i.type<>'medical' AND st.quantity>0 AND l.status='pending'")["n"]
     return {
-        "open_orders": {row["kind"]: row["count"] for row in groups},
-        "inspect_count": db.one("SELECT COUNT(*) AS n FROM lots WHERE status='pending'")["n"],
-        "billing_count": db.one("SELECT COUNT(*) AS n FROM clinical WHERE status<>'confirmed'")["n"],
         "stock_count": len(stock), "expiry": sorted(expiry,key=lambda row:row["days_left"]), "low": low,
-        "recent": db.all(DOCUMENTS+" ORDER BY d.created DESC LIMIT 8"),
+        "recent": db.all(DOCUMENTS+" WHERE "+INDUSTRIAL_DOCUMENT+" ORDER BY d.created DESC LIMIT 8"),
         "factory_open":{row["kind"]:row["count"] for row in factory_counts}, "factory_pending":factory_pending,
         "factory_due":db.all(DOCUMENTS+factory_open+" AND d.due IS NOT NULL ORDER BY d.due,d.created LIMIT 8"),
     }
 
 
 def state(db,account):
-    clinical_access = account["role"] in {"admin","clinical"}
     return {
         "account":account,"today":today(),
-        "items":db.all("SELECT * FROM items ORDER BY code"),
-        "sites":db.all("SELECT * FROM sites ORDER BY code"),
-        "partners":db.all("SELECT * FROM partners ORDER BY code"),
-        "boms":db.all("SELECT b.*,i.code,i.name FROM boms b JOIN items i ON i.id=b.item_id ORDER BY i.code,b.created DESC"),
-        "documents":db.all(DOCUMENTS+" ORDER BY d.created DESC LIMIT 300"),
-        "lots":db.all("SELECT l.*,i.code AS item_code,i.name AS item_name,i.tracked FROM lots l JOIN items i ON i.id=l.item_id ORDER BY l.created DESC"),
+        "items":db.all("SELECT * FROM items WHERE type<>'medical' ORDER BY code"),
+        "sites":db.all("SELECT * FROM sites WHERE type='factory' ORDER BY code"),
+        "partners":db.all("SELECT * FROM partners WHERE id<>'medicalvendor' ORDER BY code"),
+        "boms":db.all("SELECT b.*,i.code,i.name FROM boms b JOIN items i ON i.id=b.item_id WHERE i.type='product' ORDER BY i.code,b.created DESC"),
+        "documents":db.all(DOCUMENTS+" WHERE "+INDUSTRIAL_DOCUMENT+" ORDER BY d.created DESC LIMIT 300"),
+        "lots":db.all("SELECT l.*,i.code AS item_code,i.name AS item_name,i.tracked FROM lots l "
+                      "JOIN items i ON i.id=l.item_id WHERE i.type<>'medical' ORDER BY l.created DESC"),
         "stock":db.all(STOCK+" ORDER BY i.code,s.code,l.code"),
-        "movements":db.all(MOVEMENTS+" ORDER BY m.created DESC LIMIT 200"),
-        "inspections":db.all("SELECT e.*,l.code AS lot,i.code AS item_code FROM inspections e JOIN lots l ON l.id=e.lot_id JOIN items i ON i.id=l.item_id ORDER BY e.created DESC LIMIT 100"),
-        "units": db.all("SELECT u.*,l.code AS lot,i.name AS item_name,i.code AS item_code,s.name AS site_name FROM units u JOIN lots l ON l.id=u.lot_id JOIN items i ON i.id=l.item_id LEFT JOIN sites s ON s.id=u.site_id ORDER BY u.code LIMIT 200"),
-        "clinical":db.all("SELECT c.*,u.code,i.name AS item_name,s.name AS site_name FROM clinical c JOIN units u ON u.id=c.unit_id JOIN lots l ON l.id=u.lot_id JOIN items i ON i.id=l.item_id JOIN sites s ON s.id=c.site_id ORDER BY c.created DESC LIMIT 300") if clinical_access else [],
-        "audit":db.all("SELECT * FROM audit ORDER BY created DESC LIMIT 200") if account["role"]=="admin" else [],
-        "users":db.all("SELECT id,username,name,role,enabled FROM users ORDER BY username") if account["role"]=="admin" and not account.get("is_demo") else [],
+        "movements":db.all(MOVEMENTS+" WHERE "+INDUSTRIAL_MOVEMENT+" ORDER BY m.created DESC LIMIT 200"),
+        "inspections":db.all("SELECT e.*,l.code AS lot,i.code AS item_code FROM inspections e JOIN lots l "
+                             "ON l.id=e.lot_id JOIN items i ON i.id=l.item_id WHERE i.type<>'medical' ORDER BY e.created DESC LIMIT 100"),
+        "audit":db.all(INDUSTRIAL_AUDIT+" ORDER BY a.created DESC LIMIT 200") if account["role"]=="admin" else [],
+        "users":db.all("SELECT id,username,name,role,enabled FROM users WHERE role<>'clinical' ORDER BY username") if account["role"]=="admin" and not account.get("is_demo") else [],
         "summary": summary(db),
     }
 
 
 def document(db,ident):
-    result=db.one(DOCUMENTS+" WHERE d.id=%s",(ident,))
+    result=db.one(DOCUMENTS+" WHERE d.id=%s AND "+INDUSTRIAL_DOCUMENT,(ident,))
     require(result,"单据不存在",404)
     result["lines"]=db.all("SELECT l.*,i.code,i.name,i.unit,i.tracked,i.type FROM document_lines l JOIN items i ON i.id=l.item_id WHERE l.doc_id=%s ORDER BY i.code",(ident,))
-    result["movements"]=db.all(MOVEMENTS+" WHERE m.ref=%s ORDER BY m.created DESC",(result["ref"],))
+    result["movements"]=db.all(MOVEMENTS+" WHERE m.ref=%s AND "+INDUSTRIAL_MOVEMENT+" ORDER BY m.created DESC",(result["ref"],))
+    result["delivery_revisions"]=db.all(
+        "SELECT previous_due,new_due,reason,actor,created FROM delivery_revisions WHERE doc_id=%s ORDER BY created DESC",(ident,),
+    )
     result["linked"]=db.all(
         "SELECT d.id,d.ref,d.kind,d.status,sl.demand_id,sl.supply_id FROM supply_links sl "
         "JOIN documents d ON d.id=CASE WHEN sl.demand_id=%s THEN sl.supply_id ELSE sl.demand_id END "
@@ -137,6 +146,7 @@ def walkthrough_targets(db):
 
 def bom_detail(db,ident):
     result=lookup(db,"boms",ident,"BOM")
+    lookup(db,"items",result["item_id"],"物料")
     result["lines"]=db.all("SELECT b.*,i.code,i.name,i.unit FROM bom_lines b JOIN items i ON i.id=b.item_id WHERE b.bom_id=%s ORDER BY i.code",(ident,))
     result["steps"]=db.all("SELECT * FROM bom_steps WHERE bom_id=%s ORDER BY step_no",(ident,))
     return result
@@ -151,7 +161,8 @@ def item_detail(db,ident):
     )
     item["stock"] = db.all(STOCK+" AND i.id=%s ORDER BY s.code,l.code",(ident,))
     item["documents"] = db.all(
-        DOCUMENTS+" JOIN document_lines dl ON dl.doc_id=d.id WHERE dl.item_id=%s ORDER BY d.created DESC LIMIT 100",(ident,),
+        DOCUMENTS+" JOIN document_lines dl ON dl.doc_id=d.id WHERE dl.item_id=%s AND "
+        +INDUSTRIAL_DOCUMENT+" ORDER BY d.created DESC LIMIT 100",(ident,),
     )
     return item
 
@@ -162,7 +173,8 @@ def trace(db,lot_id,scan,account):
         unit=find_unit(db,scan)
         require(unit,"包装码不存在",404)
         lot_id=unit["lot_id"]
-    lot=db.one("SELECT l.*,i.code AS item_code,i.name AS item_name FROM lots l JOIN items i ON i.id=l.item_id WHERE l.id=%s",(lot_id,))
+    lot=db.one("SELECT l.*,i.code AS item_code,i.name AS item_name FROM lots l JOIN items i ON i.id=l.item_id "
+               "WHERE l.id=%s AND i.type<>'medical'",(lot_id,))
     require(lot,"批次不存在",404)
     graph={}
     totals={}
@@ -174,21 +186,18 @@ def trace(db,lot_id,scan,account):
           )
           SELECT DISTINCT l.id,l.code,i.name,i.code AS item_code,l.status,l.expiry
           FROM graph g JOIN lots l ON l.id=g.id JOIN items i ON i.id=l.item_id
-          WHERE l.id<>%s ORDER BY i.code,l.code LIMIT 1001""",(lot_id,lot_id))
+          WHERE l.id<>%s AND i.type<>'medical' ORDER BY i.code,l.code LIMIT 1001""",(lot_id,lot_id))
         totals[direction]=len(links)>1000
         graph[direction]=links[:1000]
-    used=db.all("SELECT c.ref,c.status,c.created,c.case_ref,u.code FROM clinical c JOIN units u ON u.id=c.unit_id WHERE u.lot_id=%s ORDER BY c.created DESC LIMIT 500",(lot_id,)) if account["role"] in {"clinical","admin"} else []
     if unit:
         unit["location"] = lookup(db,"sites",unit["site_id"],"仓库")["name"] if unit["site_id"] else ""
-    return dict(lot=lot,unit=unit,**graph,truncated=any(totals.values()),uses=used,
+    return dict(lot=lot,unit=unit,**graph,truncated=any(totals.values()),
                 stock=db.all(STOCK+" AND l.id=%s ORDER BY s.code",(lot_id,)),
-                movements=db.all(MOVEMENTS+" WHERE m.lot_id=%s ORDER BY m.created DESC LIMIT 500",(lot_id,)))
+                movements=db.all(MOVEMENTS+" WHERE m.lot_id=%s AND "+INDUSTRIAL_MOVEMENT+" ORDER BY m.created DESC LIMIT 500",(lot_id,)))
 
 
 EXPORTS = {
     "stock": (STOCK+" ORDER BY i.code,s.code,l.code", (("code","物料编码"),("name","名称"),("site_name","仓库"),("lot","批号"),("expiry","效期"),("status","状态"),("quantity","库存"),("unit","单位"))),
-    "movements": (MOVEMENTS+" ORDER BY m.created DESC", (("created","时间 UTC"),("kind","业务"),("ref","单据"),("item_code","物料编码"),("item_name","名称"),("site_name","仓库"),("lot","批号"),("quantity","数量"),("unit","单位"),("actor","操作人"),("detail","说明"))),
-    "audit": ("SELECT * FROM audit ORDER BY created DESC", (("created","时间 UTC"),("actor","账号"),("action","操作"),("ref","引用"),("detail","说明"))),
-    "clinical": ("SELECT c.*,u.code,i.name AS item_name FROM clinical c JOIN units u ON u.id=c.unit_id JOIN lots l ON l.id=u.lot_id JOIN items i ON i.id=l.item_id ORDER BY c.created DESC",
-                 (("created","时间 UTC"),("ref","耗用单"),("case_ref","手术/业务号"),("item_name","耗材"),("code","包装码"),("status","计费状态"),("billing_ref","计费回执"),("note","备注"))),
+    "movements": (MOVEMENTS+" WHERE "+INDUSTRIAL_MOVEMENT+" ORDER BY m.created DESC", (("created","时间 UTC"),("kind","业务"),("ref","单据"),("item_code","物料编码"),("item_name","名称"),("site_name","仓库"),("lot","批号"),("quantity","数量"),("unit","单位"),("actor","操作人"),("detail","说明"))),
+    "audit": (INDUSTRIAL_AUDIT+" ORDER BY a.created DESC", (("created","时间 UTC"),("actor","账号"),("action","操作"),("ref","引用"),("detail","说明"))),
 }
