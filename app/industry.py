@@ -71,15 +71,18 @@ def assign_step(db,payload,account):
 
 
 UNREGISTERED = (" FROM movements m JOIN documents d ON d.ref=m.ref "
-                "JOIN sites s ON s.id=d.site_id WHERE s.type='factory' AND m.kind='销售发货' "
+                "JOIN sites s ON s.id=d.site_id LEFT JOIN delivery_movements dm ON dm.movement_id=m.id "
+                "LEFT JOIN delivery_commitments c ON c.id=dm.commitment_id WHERE s.type='factory' AND m.kind='销售发货' "
                 "AND d.kind='sale' AND m.quantity<0 AND NOT EXISTS "
                 "(SELECT 1 FROM shipment_movements sm WHERE sm.movement_id=m.id)")
 
 
 def dispatch(db,payload,account):
     order = get(db,"documents",payload,"id","销售单")
-    rows = db.all("SELECT m.id"+UNREGISTERED+" AND d.id=%s ORDER BY m.created,m.id",(order["id"],))
-    require(rows,"该销售单没有待登记运单的发货流水",409)
+    commitment=field(payload,"commitment_id","交付批次",64,True)
+    rows = db.all("SELECT m.id"+UNREGISTERED+" AND d.id=%s AND COALESCE(c.id,'')=%s ORDER BY m.created,m.id",
+                  (order["id"],commitment))
+    require(rows,"该销售单与交付批次没有待登记运单的发货流水",409)
     carrier = field(payload,"carrier","承运商",100)
     tracking = field(payload,"tracking","运单号",100)
     due = date_field(payload,"due","预计签收日期")
@@ -259,6 +262,10 @@ def view(db,module,account,ident=""):
     permitted(account,MODULE_ROLES[module])
     if ident and module=="transport":
         shipment = get(db,"shipments",{"id":ident},"id","运单")
+        shipment["commitment"]=db.one(
+            "SELECT c.ref,c.due FROM shipment_movements sm JOIN delivery_movements dm ON dm.movement_id=sm.movement_id "
+            "JOIN delivery_commitments c ON c.id=dm.commitment_id WHERE sm.shipment_id=%s LIMIT 1",(ident,),
+        )
         shipment["lines"] = db.all(
             "SELECT -m.quantity AS quantity,l.id AS lot_id,l.code AS lot,i.code,i.name,i.unit "
             "FROM shipment_movements sm JOIN movements m ON m.id=sm.movement_id JOIN lots l ON l.id=m.lot_id "
@@ -281,7 +288,9 @@ def view(db,module,account,ident=""):
                       "ORDER BY c.created DESC LIMIT 300")
     if module=="transport":
         return {
-            "pending":db.all("SELECT d.id,d.ref,COUNT(*) AS batches"+UNREGISTERED+" GROUP BY d.id,d.ref ORDER BY MAX(m.created) DESC LIMIT 300"),
+            "pending":db.all("SELECT d.id,d.ref,c.id AS commitment_id,c.ref AS commitment_ref,c.due AS commitment_due,"
+                             "COUNT(*) AS batches"+UNREGISTERED
+                             +" GROUP BY d.id,d.ref,c.id,c.ref,c.due ORDER BY MAX(m.created) DESC LIMIT 300"),
             "shipments":db.all("SELECT sh.*,d.ref AS doc_ref,p.name AS customer FROM shipments sh JOIN documents d ON d.id=sh.doc_id "
                                "LEFT JOIN partners p ON p.id=d.partner_id ORDER BY sh.dispatched DESC LIMIT 300"),
         }

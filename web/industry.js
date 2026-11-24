@@ -41,10 +41,11 @@ function transportPage(view) {
   const selected=industryTabs.transport;
   const matchesStatus=row=>selected==="all"||(selected==="signed"?!!row.signed:!row.signed&&(selected==="transit"||row.due<state.today));
   return head(industryTitles.transport,"把已发生的出库流水登记到运单，跟踪预计到货和签收凭证。")
-    +industryMetrics([["待登记销售单",view.pending.length],["在途运单",view.shipments.filter(row=>!row.signed).length],
+    +industryMetrics([["待登记运单批次",view.pending.length],["在途运单",view.shipments.filter(row=>!row.signed).length],
       ["签收逾期",view.shipments.filter(row=>!row.signed&&row.due<state.today).length]])
-    +industrySections("搜索销售单、运单、客户或承运商",(["all","pending"].includes(selected)?panel("待登记运单",table(["销售单","待登记发货流水","操作"],view.pending.filter(row=>matches(row.ref)),row=>[
-      link(row.ref,"document",row.id),numeric(row.batches),button("登记运单","dispatch",row.id,"small"),
+    +industrySections("搜索销售单、运单、客户或承运商",(["all","pending"].includes(selected)?panel("待登记运单",table(["销售单","交付批次","待登记发货流水","操作"],view.pending.filter(row=>matches(row.ref,row.commitment_ref)),row=>[
+      link(row.ref,"document",row.id),row.commitment_ref?code(row.commitment_ref)+sub(row.commitment_due):"—",
+      numeric(row.batches),button("登记运单","dispatch",row.id+"|"+(row.commitment_id||""),"small"),
     ])):"")+(selected==="pending"?"":panel("运输跟踪",table(["运单／物流单号","原销售单","客户","承运商","预计签收","状态","操作"],
       view.shipments.filter(row=>matchesStatus(row)&&matches(row.ref,row.tracking,row.doc_ref,row.customer,row.carrier,row.receipt)),row=>[
       link(row.ref,"shipmentDetail",row.id)+sub(row.tracking),link(row.doc_ref,"document",row.doc_id),text(row.customer),
@@ -185,9 +186,13 @@ function supplyChain(model) {
   ],"暂无已关联的单据。")+add);
 }
 
-function dispatchForm(id) {
+function dispatchForm(value) {
+  const [id,commitment_id=""]=value.split("|");
+  const pending=industryViews.transport?.pending.find(row=>row.id===id&&(row.commitment_id||"")===commitment_id);
   formDialog("登记实际承运运单","dispatch",grid(input("carrier","承运商",{maxlength:100})+input("tracking","运单号",{maxlength:100})
-    +input("due","预计签收日期",{type:"date"}))+help("将这张销售单尚未登记运单的发货流水合并登记。"),"登记运单",values=>({id,...values}));
+    +input("due","预计签收日期",{type:"date",value:pending?.commitment_due||""}))
+    +help(pending?.commitment_ref?"只合并 "+pending.commitment_ref+" 的待登记发货流水。":"合并本单未挂交付承诺的待登记发货流水。"),
+    "登记运单",values=>({id,commitment_id,...values}));
 }
 
 function signShipmentForm(id) {
@@ -199,6 +204,7 @@ async function shipmentDetail(id) {
   const row=await request("/api/industry/transport/"+encodeURIComponent(id));
   openGuidedDetail("运单 · "+row.ref,`<div class="detail-meta">${shipmentStatus(row)}${text(row.carrier)} · ${text(row.tracking)}
     <span>预计签收 ${text(row.due)}</span><span>实际签收 ${text(timestamp(row.signed))}</span><span>凭证 ${clean(row.receipt)}</span></div>`
+    +(row.commitment?help("对应交付批次 "+row.commitment.ref+" · 承诺签收 "+row.commitment.due):"")
     +section("装运批次",table(["物料","批次","数量"],row.lines,line=>[
       item(line.name,line.code),link(line.lot,"lotTrace",line.lot_id),unitQuantity(line.quantity,line.unit),
     ])));

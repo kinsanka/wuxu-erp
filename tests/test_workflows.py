@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from http.client import parse_headers
 from pathlib import Path
 from unittest.mock import patch
@@ -14,7 +14,7 @@ from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"app"))
 
 from db import initialize, transaction
-from erp import BusinessError, execute, today
+from erp import BusinessError, ERP_ZONE, execute, today
 from main import Handler
 from read import document, trace
 from seed import ADMIN, bootstrap
@@ -350,6 +350,101 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(doc["linked"][0]["id"],work)
         self.assertEqual(doc["delivery_revisions"][0]["previous_due"],self.ahead(2))
         self.assertEqual(doc["due"],self.ahead(3))
+
+    def test_batch_reservations_protect_stock_and_consume_the_owners_hold(self):
+        _,headers,_=self.request("/api/login",{"username":"admin","password":self.admin_password})
+        session=headers["Set-Cookie"].split(";",1)[0]
+        first,second=[self.action("sale",partner_id="customer",site_id="factory",
+                                  lines=[dict(item_id="al",quantity="35",price="42")])["id"] for _ in range(2)]
+        lot=self.lot("AL-DEMO-01")["id"]
+        for order in (first,second):
+            self.action("approve",id=order,decision="approve")
+        def reserve(order):
+            return self.request("/api/action/reserve_stock",dict(id=order,lot_id=lot,quantity="35",note="确定交付"),
+                                cookie=session)[0]
+        with ThreadPoolExecutor(2) as pool:
+            results=list(pool.map(reserve,(first,second)))
+        self.assertEqual(sorted(results),[200,409])
+        winner=(first,second)[results.index(200)]
+        loser=second if winner==first else first
+        losing_line=self.row("SELECT id FROM document_lines WHERE doc_id=%s",(loser,))["id"]
+        with self.assertRaises(BusinessError):
+            self.action("ship",id=loser,line_id=losing_line,quantity="5")
+        with self.assertRaisesRegex(BusinessError,"已锁定"):
+            self.action("transfer",lot_id=lot,from_id="factory",to_id="finished",quantity="5")
+        where=(winner,lot)
+        with transaction() as db:
+            model=document(db,winner)
+            self.assertEqual(model["reservations"][0]["own"],35000)
+            self.assertEqual(model["lines"][0]["inventory"]["released"],39000)
+        self.action("ship",id=winner,line_id=model["lines"][0]["id"],quantity="2")
+        self.assertEqual(self.row("SELECT quantity FROM stock_reservations WHERE doc_id=%s AND lot_id=%s",where)["quantity"],33000)
+        self.action("inspect",lot_id=lot,verdict="blocked",note="来料复核")
+        with self.assertRaisesRegex(BusinessError,"本单预留批次"):
+            self.action("ship",id=winner,line_id=model["lines"][0]["id"],quantity="1")
+        status,_,_=self.request("/api/action/reserve_stock",dict(id=winner,lot_id=lot,quantity="0",note="释放冻结批次"),cookie=session)
+        self.assertEqual(status,200)
+        self.assertIsNone(self.row("SELECT quantity FROM stock_reservations WHERE doc_id=%s AND lot_id=%s",where))
+
+    def test_finite_line_calendar_blocks_overlaps_and_controls_start(self):
+        _,headers,_=self.request("/api/login",{"username":"admin","password":self.admin_password})
+        session=headers["Set-Cookie"].split(";",1)[0]
+        def send(action,payload,status=200):
+            actual,_,body=self.request("/api/action/"+action,payload,cookie=session)
+            self.assertEqual(actual,status,body)
+        send("production_line",dict(code="ASM-01",name="装配线",site_id="factory",shift_start="08:00",capacity="480"))
+        line=self.row("SELECT id FROM production_lines")["id"]
+        day=self.ahead(1)
+        first,second=self.work("1")["id"],self.work("1")["id"]
+        booking=dict(line_id=line,day=day,start="08:00",minutes="120",note="交付排程")
+        send("schedule_work",dict(booking,id=first))
+        send("schedule_work",dict(booking,id=second,start="09:59"),409)
+        send("schedule_work",dict(booking,id=second,start="15:00"),409)
+        send("schedule_work",dict(booking,id=second,start="10:00"))
+        send("line_calendar",dict(line_id=line,day=day,capacity="180",note="设备检修"),409)
+        start=dict(id=first)
+        send("start",start,409)
+        mock_time=datetime.fromisoformat(day+"T08:01").replace(tzinfo=ERP_ZONE)
+        with patch("erp.datetime") as clock:
+            clock.now.return_value=mock_time
+            send("start",start)
+        send("schedule_work",dict(booking,id=first,clear=True),409)
+        self.action("approve",id=second,decision="cancel")
+        status,_,body=self.request("/api/execution/production?day="+day,cookie=session)
+        self.assertEqual(status,200)
+        self.assertEqual([row["doc_id"] for row in json.loads(body)["slots"]],[first])
+
+    def test_delivery_commitments_separate_dispatch_and_count_actual_signatures(self):
+        _,headers,_=self.request("/api/login",{"username":"admin","password":self.admin_password})
+        session=headers["Set-Cookie"].split(";",1)[0]
+        sale=self.row("SELECT id FROM documents WHERE kind='sale'")["id"]
+        line=self.row("SELECT id FROM document_lines WHERE doc_id=%s",(sale,))["id"]
+        def api(path,payload=None,status=200):
+            actual,_,body=self.request(path,payload,cookie=session)
+            self.assertEqual(actual,status,body)
+            return json.loads(body)
+        pledge=dict(id=sale,line_id=line,quantity="2",due=self.ahead(1),note="分批到货确认")
+        api("/api/action/delivery_commitment",pledge)
+        api("/api/action/delivery_commitment",dict(pledge,due=self.ahead(2)))
+        api("/api/action/delivery_commitment",pledge,409)
+        first,second=api("/api/document/"+sale)["commitments"]
+        self.action("inspect",lot_id=self.lot("FG-DEMO-001")["id"],verdict="released",note="成品检验通过")
+        ship=dict(id=sale,line_id=line,quantity="2")
+        api("/api/action/ship",ship,409)
+        api("/api/action/ship",dict(ship,commitment_id=first["id"],quantity="3"),409)
+        for batch in (first,second):
+            api("/api/action/ship",dict(ship,commitment_id=batch["id"]))
+        pending=api("/api/industry/transport")["pending"]
+        self.assertEqual({row["commitment_id"] for row in pending},{first["id"],second["id"]})
+        carrier=dict(id=sale,carrier="专线",tracking="DLV-A",due=self.ahead(1))
+        api("/api/action/dispatch",carrier,409)
+        api("/api/action/dispatch",dict(carrier,commitment_id=first["id"]))
+        shipment=self.row("SELECT id FROM shipments WHERE tracking='DLV-A'")["id"]
+        api("/api/action/sign_shipment",dict(id=shipment,receipt="POD-A"))
+        signed,waiting=api("/api/document/"+sale)["commitments"]
+        self.assertEqual((signed["signed"],waiting["signed"]),(2000,0))
+        self.assertEqual(signed["status"],"signed")
+        self.assertEqual(api("/api/industry/transport/"+shipment)["commitment"]["ref"],first["ref"])
 
     def test_walkthrough_links_to_existing_erp_records(self):
         self.assertEqual(self.request("/api/walkthrough")[0],401)

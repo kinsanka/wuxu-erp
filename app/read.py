@@ -1,4 +1,5 @@
 from erp import date, lookup, plan, require, today, find_unit
+from execution import commitments, reservation_view, work_slot
 
 DOCUMENTS = ("SELECT d.*,s.name AS site_name,p.name AS partner_name,b.version,"
              " (SELECT COUNT(*) FROM document_lines x WHERE x.doc_id=d.id) AS line_count"
@@ -7,10 +8,12 @@ DOCUMENTS = ("SELECT d.*,s.name AS site_name,p.name AS partner_name,b.version,"
 INDUSTRIAL_DOCUMENT = ("s.type='factory' AND NOT EXISTS (SELECT 1 FROM document_lines dl "
                        "JOIN items di ON di.id=dl.item_id WHERE dl.doc_id=d.id AND di.type='medical')")
 
-STOCK = ("SELECT st.quantity,l.id AS lot_id,l.code AS lot,l.expiry,l.status,s.id AS site_id,s.name AS site_name,"
+STOCK = ("SELECT st.quantity,CAST(COALESCE(r.held,0) AS BIGINT) AS reserved,l.id AS lot_id,l.code AS lot,l.expiry,l.status,s.id AS site_id,s.name AS site_name,"
          " i.id AS item_id,i.code,i.name,i.unit,i.type,i.tracked"
          " FROM stock st JOIN lots l ON l.id=st.lot_id JOIN sites s ON s.id=st.site_id"
-         " JOIN items i ON i.id=l.item_id WHERE st.quantity>0 AND s.type='factory' AND i.type<>'medical'")
+         " JOIN items i ON i.id=l.item_id LEFT JOIN (SELECT lot_id,site_id,SUM(quantity) AS held "
+         "FROM stock_reservations GROUP BY lot_id,site_id) r ON r.lot_id=st.lot_id AND r.site_id=st.site_id "
+         "WHERE st.quantity>0 AND s.type='factory' AND i.type<>'medical'")
 
 MOVEMENTS = ("SELECT m.*,l.code AS lot,l.status AS lot_status,l.expiry,i.code AS item_code,i.name AS item_name,i.unit,"
              " s.name AS site_name,d.id AS doc_id FROM movements m JOIN lots l ON l.id=m.lot_id"
@@ -33,7 +36,7 @@ def summary(db):
     expiry = []
     for row in stock:
         if row["status"] == "released" and (not row["expiry"] or row["expiry"] >= current):
-            by_item[row["item_id"]] = by_item.get(row["item_id"],0) + row["quantity"]
+            by_item[row["item_id"]] = by_item.get(row["item_id"],0) + row["quantity"]-row["reserved"]
         if row["expiry"]:
             row["days_left"] = (date.fromisoformat(row["expiry"])-current_date).days
             if row["days_left"] <= 60:
@@ -90,7 +93,9 @@ def document(db,ident):
         "JOIN documents d ON d.id=CASE WHEN sl.demand_id=%s THEN sl.supply_id ELSE sl.demand_id END "
         "WHERE sl.demand_id=%s OR sl.supply_id=%s ORDER BY sl.created",(ident,ident,ident),
     )
+    result["reservations"]=reservation_view(db,result)
     if result["kind"]=="sale":
+        result["commitments"]=commitments(db,ident)
         result["shipments"]=db.all("SELECT ref,carrier,tracking,due,signed,receipt FROM shipments WHERE doc_id=%s ORDER BY dispatched",(ident,))
         balances = {
             line["item_id"]: dict(released=0,pending=0,blocked=0,expired=0)
@@ -98,15 +103,19 @@ def document(db,ident):
         }
         current = today()
         for row in db.all(
-            "SELECT l.item_id,l.status,l.expiry,s.quantity FROM document_lines dl JOIN lots l ON l.item_id=dl.item_id "
-            "JOIN stock s ON s.lot_id=l.id WHERE dl.doc_id=%s AND s.site_id=%s AND s.quantity>0",
-            (ident,result["site_id"]),
+            "SELECT l.item_id,l.status,l.expiry,s.quantity,CAST(COALESCE(r.held,0) AS BIGINT) AS held "
+            "FROM document_lines dl JOIN lots l ON l.item_id=dl.item_id "
+            "JOIN stock s ON s.lot_id=l.id LEFT JOIN (SELECT lot_id,SUM(quantity) AS held FROM stock_reservations "
+            "WHERE site_id=%s AND doc_id<>%s GROUP BY lot_id) r ON r.lot_id=l.id "
+            "WHERE dl.doc_id=%s AND s.site_id=%s AND s.quantity>0",
+            (result["site_id"],ident,ident,result["site_id"]),
         ):
             bucket = "expired" if row["expiry"] and row["expiry"]<current else row["status"]
-            balances[row["item_id"]][bucket] += row["quantity"]
+            balances[row["item_id"]][bucket] += row["quantity"]-row["held"] if bucket=="released" else row["quantity"]
         for line in result["lines"]:
             line["inventory"] = balances[line["item_id"]]
     if result["kind"]=="work":
+        result["slot"]=work_slot(db,ident)
         result["steps"]=db.all(
             "SELECT b.*,w.minutes,w.note,w.actor,w.created,p.name AS person,p.code AS person_code FROM bom_steps b "
             "LEFT JOIN work_steps w ON w.step_id=b.id AND w.doc_id=%s LEFT JOIN work_assignments a ON a.step_id=b.id AND a.doc_id=%s "
@@ -197,7 +206,7 @@ def trace(db,lot_id,scan,account):
 
 
 EXPORTS = {
-    "stock": (STOCK+" ORDER BY i.code,s.code,l.code", (("code","物料编码"),("name","名称"),("site_name","仓库"),("lot","批号"),("expiry","效期"),("status","状态"),("quantity","库存"),("unit","单位"))),
+    "stock": (STOCK+" ORDER BY i.code,s.code,l.code", (("code","物料编码"),("name","名称"),("site_name","仓库"),("lot","批号"),("expiry","效期"),("status","状态"),("quantity","库存"),("reserved","已锁定"),("unit","单位"))),
     "movements": (MOVEMENTS+" WHERE "+INDUSTRIAL_MOVEMENT+" ORDER BY m.created DESC", (("created","时间 UTC"),("kind","业务"),("ref","单据"),("item_code","物料编码"),("item_name","名称"),("site_name","仓库"),("lot","批号"),("quantity","数量"),("unit","单位"),("actor","操作人"),("detail","说明"))),
     "audit": (INDUSTRIAL_AUDIT+" ORDER BY a.created DESC", (("created","时间 UTC"),("actor","账号"),("action","操作"),("ref","引用"),("detail","说明"))),
 }

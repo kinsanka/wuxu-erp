@@ -15,12 +15,13 @@ const rights = {
   master:["planner"], purchase:["planner"], sale:["planner"], approve:["planner"], receive:["warehouse"],
   ship:["warehouse"], bom:["planner"], work:["planner"], start:["planner"], report:["planner"], finish:["planner"],
   inspect:["warehouse"], transfer:["warehouse"], expedite:["planner"], revise_delivery:["planner"], user:[],
+  reserve_stock:["planner"],schedule_work:["planner"],delivery_commitment:["planner"],
   link_supply:["planner"], assign_step:["planner"],
 };
 const navigation = [
   ["概览", [["home","工作台","⌂"]]],
   ["订单与交付", [["sale","销售履约","↗"],["expedite","急单处理","!"],["purchase","采购管理","↙"],["transport","运输与签收","→"]]],
-  ["计划与生产", [["work","生产与 BOM","▦"],["people","人员与工时","◫"]]],
+  ["计划与生产", [["work","生产与 BOM","▦"],["capacity","产线排程","▥"],["people","人员与工时","◫"]]],
   ["库存管理", [["stock","库存与质检","◇"],["counts","库存盘点","▤"],["trace","批次追溯","◎"]]],
   ["财务与基础资料", [["finance","应收应付","¥"],["master","主数据","≡"],["reports","报表与审计","▤"],["users","账号管理","☷"]]],
 ];
@@ -182,9 +183,10 @@ function stockPage() {
   if (stockTab==="stock") {
     const stocks=state.stock.filter(row=>matches(row.code,row.name,row.lot,row.site_name) && (!filter.site||filter.site===row.site_id) && (!filter.status||filter.status===row.status));
     const countAllowed=showNav("counts");
-    body=table(["物料","仓库","批次","实物在库","可用库存","效期","质检状态",...(countAllowed?["盘点"]:[])],stocks,row=>[
+    body=table(["物料","仓库","批次","实物在库","已锁定","未锁可用","效期","质检状态",...(countAllowed?["盘点"]:[])],stocks,row=>[
       item(row.name,row.code),text(row.site_name),link(row.lot,"lotTrace",row.lot_id),unitQuantity(row.quantity,row.unit),
-      unitQuantity(row.status==="released"&&!isExpired(row)?row.quantity:0,row.unit),dateText(row),cfgLabel(lotStatus,row.status),
+      unitQuantity(row.reserved,row.unit),unitQuantity(row.status==="released"&&!isExpired(row)?row.quantity-row.reserved:0,row.unit),
+      dateText(row),cfgLabel(lotStatus,row.status),
       ...(countAllowed?[button("盘点","inventoryCount",row.lot_id+"|"+row.site_id,"small")]:[]),
     ]);
     params={status:pairs(lotStatus,x=>x[0]),sites:true,actions:exportLink("导出库存","stock")};
@@ -257,7 +259,7 @@ function usersPage() {
 }
 
 const renderers={home:homePage,purchase:()=>ordersPage("purchase"),sale:()=>ordersPage("sale"),expedite:expeditePage,work:workPage,stock:stockPage,trace:tracePage,master:masterPage,reports:reportsPage,users:usersPage,
-  transport:()=>industryPage("transport"),people:()=>industryPage("people"),finance:()=>industryPage("finance"),counts:()=>industryPage("counts")};
+  transport:()=>industryPage("transport"),people:()=>industryPage("people"),finance:()=>industryPage("finance"),counts:()=>industryPage("counts"),capacity:capacityPage};
 
 function render() {
   $("crumb").textContent=pages[page];
@@ -293,6 +295,7 @@ function go(id,search="") {
 }
 
 async function syncPageData() {
+  if (page==="capacity") await loadProduction();
   if (Object.hasOwn(orderTabs,page)) await loadOrders(page);
   if (Object.hasOwn(industryRoles,page)) await loadIndustry(page);
 }
@@ -335,6 +338,8 @@ async function loadState() {
 
 function showLogin() {
   endWalkthrough();
+  productionView=null;
+  capacityDay="";
   for (const module of Object.keys(industryViews)) delete industryViews[module];
   state=null;
   traceRecord=null;
@@ -548,6 +553,8 @@ async function openDocument(id, isCurrent=()=>true) {
   const sections=[];
   if (model.note) sections.push(`<p class="detail-note">${html(model.note)}</p>`);
   sections.push(lines);
+  if (work) sections.push(scheduleSection(model));
+  if (model.kind!=="purchase") sections.push(reservationSection(model));
   if (work && model.plan.length) sections.push(section("单阶缺料试算",help("基于当前仓库的可用库存试算。预计净缺扣除工单日期窗口内的计划采购量，实际领料以收货放行后的可用量为准。")
     + table(["组件","需求","当前可用","窗口内计划采购","当前缺料","预计净缺料","已请购草稿","处理"],model.plan,row=>[
       item(row.name,row.code),unitQuantity(row.required,row.unit),unitQuantity(row.available,row.unit),unitQuantity(row.incoming,row.unit),
@@ -572,6 +579,7 @@ async function openDocument(id, isCurrent=()=>true) {
   if (model.kind==="sale") {
     actions.push(button("急单跟进","expediteDetail",id));
     sections.push(salesProgress(model));
+    sections.push(commitmentSection(model));
   }
   if (model.kind==="purchase") sections.push(purchaseProgress(model));
   if (model.linked.length || ((work || model.kind==="sale") && allowed("link_supply") && model.status!=="cancelled")) sections.push(supplyChain(model));
@@ -589,14 +597,31 @@ async function tradeLine(kind,serial) {
   if (!line) throw new Error("单据行不存在");
   const receive=kind==="receive";
   const available=line.quantity-line.fulfilled;
+  const planned=receive?[]:model.commitments.filter(row=>row.line_id===lineId&&!row.cancelled);
+  const open=planned.filter(row=>row.quantity>row.shipped);
+  if(planned.length&&!open.length) {
+    openDialog("销售发货",help("已登记的承诺均已出库。请在原销售单为剩余数量新增交付批次。")
+      +button("返回销售单","document",id));
+    return;
+  }
+  const promiseField=open.length?select("commitment_id","交付批次",pick(open,row=>row.ref+" · "+row.due
+    +" · 待发 "+qty(row.quantity-row.shipped)+" "+row.unit),open[0].id):"";
   const demoLot=walkthrough?.targets.run_id&&walkthrough.targets.purchase.id===id?walkthrough.targets.code+"-RM01":"";
   const receiveFields=receive?input("lot","收货批号",{maxlength:64,value:demoLot})+input("expiry","效期",{type:"date",required:false,min:state.today}):"";
   const codes=receive&&line.tracked?memo("codes","包装码（一行一码）",true,"扫描枪或手动输入，每件一个唯一包装码",12000):"";
-  formDialog((receive?"采购收货":"销售发货")+" · "+line.name,kind,
-    help("待处理 "+qty(available)+" "+line.unit+(receive?"":"。将优先使用近期到期的已放行批次。"))
-    +grid(input("quantity","本次数量",{type:"number",min:line.tracked?"1":"0.001",step:line.tracked?"1":"0.001",max:String(available/1000)})+receiveFields)
+  const form=formDialog((receive?"采购收货":"销售发货")+" · "+line.name,kind,
+    help("待处理 "+qty(available)+" "+line.unit+(receive?"":"。先使用本单锁定批次，再按效期使用未锁库存。"))
+    +grid(promiseField+input("quantity","本次数量",{type:"number",min:line.tracked?"1":"0.001",step:line.tracked?"1":"0.001",max:String(available/1000)})+receiveFields)
     +codes+memo(),receive?"确认收货":"确认发货",
     values=>({...values,id,line_id:lineId}),()=>openDocument(id),id);
+  if(open.length) {
+    const limit=()=>{
+      const row=open.find(entry=>entry.id===form.elements.commitment_id.value);
+      form.elements.quantity.max=String((row?row.quantity-row.shipped:available)/1000);
+    };
+    form.elements.commitment_id.addEventListener("change",limit);
+    limit();
+  }
 }
 
 function reviewDocument(id,decision) {
@@ -679,6 +704,7 @@ function tab(name,value) {
 
 const handlers = {
   ...orderHandlers,
+  ...executionHandlers,
   ...walkthroughHandlers,
   ...industryHandlers,
   go:async id=>{
@@ -714,6 +740,11 @@ document.addEventListener("input",event=>{
   }
 });
 document.addEventListener("change",event=>{
+  if(event.target.id==="capacity-day"&&state&&event.target.value) {
+    capacityDay=event.target.value;
+    loadProduction().catch(failure);
+    return;
+  }
   const filterName=event.target.dataset.filter;
   if (filterName && filterName!=="q" && state) {
     filter[filterName]=event.target.value;

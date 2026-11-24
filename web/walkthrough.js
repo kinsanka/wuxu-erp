@@ -30,6 +30,22 @@ const practiceSteps = [
   {page:"trace",title:"批次追溯",note:"从本案例成品回查来料批次、完工工单和发货记录。"},
 ];
 
+const rushPracticeSteps = [
+  ...practiceSteps.slice(0,2),
+  {page:"sale",document:"sale",check:"rush",title:"登记真实急单",note:"点「急单跟进」，登记负责人、优先级和目标签收日期。"},
+  {page:"sale",document:"sale",check:"commitments",title:"分批交付承诺",note:"在原销售单登记两批交付承诺，每批 2 套，可分别填写签收日。"},
+  ...practiceSteps.slice(2,4),
+  {page:"work",document:"work",check:"raw_lock",title:"工单组件锁料",note:"审核工单后，在「生产组件锁料」把已放行的 8 件毛坯锁给本工单。"},
+  {page:"work",document:"work",check:"slot",title:"产线有限排程",note:"为本工单登记覆盖当前时间的生产时段。可以查看产线剩余容量和已排工单。"},
+  ...practiceSteps.slice(4,7),
+  {page:"sale",document:"sale",check:"product_lock",title:"销售批次锁料",note:"在原销售单锁定刚放行的 4 套成品，避免其他单据先占用。"},
+  practiceSteps[7],
+  {...practiceSteps[8],note:"分别选择两个交付批次，各发货 2 套。"},
+  {...practiceSteps[9],note:"按交付批次分别登记承运运单和签收凭证，确认两批均已签收。"},
+  {page:"sale",document:"sale",check:"rush_close",title:"急单结案",note:"回到原销售单的「急单跟进」，核对两批签收后关闭急单。"},
+  ...practiceSteps.slice(10),
+];
+
 let walkthrough = null;
 let launchingPractice = false;
 
@@ -79,12 +95,13 @@ async function startWalkthrough() {
     await beginWalkthrough(targets);
     return;
   }
-  openDialog("工业实操演示",help("每个新案例使用独立演示仓、料号和单据。审核、收货、领料、报工等操作在相应模块提交。")
-    +`<div class="form-actions">${targets.latest?button("继续上次实操","resumePractice",targets.latest.id):""}${button("新建实操案例","launchPractice","","primary")}</div>`);
+  openDialog("工业实操演示",help("案例会生成样例单据，审核、锁料、排程、报工和签收均在相应模块提交。")
+    +`<div class="form-actions">${targets.latest?button("继续上次实操","resumePractice",targets.latest.id):""}
+      ${button("新建通用实操","launchPractice")}${button("新建急单实操","launchRushPractice","","primary")}</div>`);
 }
 
 async function beginWalkthrough(targets,resume=false) {
-  const steps = (targets.run_id?practiceSteps:walkthroughSteps).filter(step=>showNav(step.page));
+  const steps = (targets.rush?rushPracticeSteps:targets.run_id?practiceSteps:walkthroughSteps).filter(step=>showNav(step.page));
   walkthrough = {index:-1,targets,steps,loading:false};
   const next = resume?steps.findIndex(step=>step.check&&!targets.ready[step.check]):0;
   await moveWalkthrough(next<0?steps.length-1:next);
@@ -99,11 +116,11 @@ async function refreshWalkthroughProgress() {
   renderWalkthrough();
 }
 
-async function launchPractice(id="") {
+async function launchPractice(id="",mode="") {
   if (launchingPractice || walkthrough) return;
   launchingPractice = true;
   try {
-    const run = id || (await request("/api/action/practice",{},requestKey())).id;
+    const run = id || (await request("/api/action/practice",mode?{mode}:{},requestKey())).id;
     const targets = await request("/api/walkthrough?run="+encodeURIComponent(run));
     await loadState();
     await beginWalkthrough(targets,!!id);
@@ -162,6 +179,7 @@ async function moveWalkthrough(index) {
 const walkthroughHandlers = {
   walkthroughStart: startWalkthrough,
   launchPractice: ()=>launchPractice(),
+  launchRushPractice: ()=>launchPractice("","rush"),
   resumePractice: launchPractice,
   walkthroughPrevious: ()=>moveWalkthrough(walkthrough?.index-1),
   walkthroughNext: ()=>{

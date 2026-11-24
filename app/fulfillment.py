@@ -31,6 +31,9 @@ def revise_delivery(db,payload,account):
             "当前单据不能调整计划日期",409)
     due = date_field(payload,"due","新计划日期")
     require(due and due>=today() and due!=order["due"],"请填写不同且不早于今天的计划日期")
+    if order["kind"]=="work":
+        slot=db.one("SELECT day FROM work_slots WHERE doc_id=%s",(order["id"],))
+        require(not slot or slot["day"]<=due,"新完工日早于已排产时段，请先调整排程",409)
     reason = field(payload,"note","调整依据",400)
     db.execute("UPDATE documents SET due=%s WHERE id=%s",(due,order["id"]))
     db.execute("INSERT INTO delivery_revisions VALUES (%s,%s,%s,%s,%s,%s,%s)",

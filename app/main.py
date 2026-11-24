@@ -20,6 +20,7 @@ from erp import BusinessError, DEMO_CREDENTIALS, authenticate, demo_login_enable
 from exercise import apply as apply_exercise, view as view_exercise
 from exercise_demo import build_demo
 from fulfillment import ORDER_ACTIONS, expedite_desk, order_desk
+from execution import EXECUTION_ACTIONS, production_board
 from industry import OPERATIONS as INDUSTRIAL_OPERATIONS, apply as apply_industry, view as view_industry
 from practice import allowed as practice_allowed, latest as latest_practice, launch as launch_practice, view as view_practice
 from read import EXPORTS, bom_detail, document, item_detail, state, trace, walkthrough_targets
@@ -33,10 +34,11 @@ STATIC = {"/": ("index.html","text/html; charset=utf-8"), "/style.css": ("style.
           "/exercise_demo.js": ("exercise_demo.js","text/javascript; charset=utf-8"),
           "/walkthrough.js": ("walkthrough.js","text/javascript; charset=utf-8"),
           "/industry.js": ("industry.js","text/javascript; charset=utf-8"),
-          "/orders.js": ("orders.js","text/javascript; charset=utf-8")}
+          "/orders.js": ("orders.js","text/javascript; charset=utf-8"),
+          "/execution.js": ("execution.js","text/javascript; charset=utf-8")}
 IDEMPOTENT_ACTIONS = {
     "master","purchase","sale","approve","receive","ship","bom","work",
-    "start","report","finish","inspect","transfer","exercise","practice", *ORDER_ACTIONS, *INDUSTRIAL_OPERATIONS,
+    "start","report","finish","inspect","transfer","exercise","practice", *ORDER_ACTIONS, *INDUSTRIAL_OPERATIONS, *EXECUTION_ACTIONS,
 }
 LOGIN_ATTEMPTS = {}
 ATTEMPT_LOCK = Lock()
@@ -69,7 +71,7 @@ def csv_export(db,kind,account):
     writer=csv.writer(output)
     writer.writerow([label for _,label in columns])
     for row in db.execute(query):
-        writer.writerow([Decimal(row[field])/1000 if field=="quantity" else safe_csv(row[field]) for field,_ in columns])
+        writer.writerow([Decimal(row[field])/1000 if field in {"quantity","reserved"} else safe_csv(row[field]) for field,_ in columns])
     return output.getvalue().encode("utf-8-sig")
 
 
@@ -77,9 +79,11 @@ def perform(db,action,payload,account):
     if action=="exercise":
         return apply_exercise(db,payload,account)
     if action=="practice":
-        return launch_practice(db,account)
+        return launch_practice(db,account,payload)
     if action in ORDER_ACTIONS:
         return ORDER_ACTIONS[action](db,payload,account)
+    if action in EXECUTION_ACTIONS:
+        return EXECUTION_ACTIONS[action](db,payload,account)
     if action in INDUSTRIAL_OPERATIONS:
         return apply_industry(db,action,payload,account)
     return execute(db,action,payload,account)
@@ -209,6 +213,8 @@ class Handler(BaseHTTPRequestHandler):
                     result=order_desk(db,path.rsplit("/",1)[-1])
                 elif path=="/api/orders/expedite" or path.startswith("/api/orders/expedite/"):
                     result=expedite_desk(db,path.removeprefix("/api/orders/expedite").lstrip("/"))
+                elif path=="/api/execution/production":
+                    result=production_board(db,{"day":parse_qs(parsed.query).get("day",[""])[0]})
                 elif path=="/api/walkthrough":
                     run=parse_qs(parsed.query).get("run",[""])[0]
                     result=view_practice(db,run,account) if run else dict(

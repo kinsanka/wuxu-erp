@@ -88,6 +88,37 @@ jobs:
           with client.open(root + "/api/orders/expedite/" + order["id"], timeout=10) as response:
               desk = json.load(response)
           assert desk["ticket"]["priority"] == "critical" and desk["work"] and desk["events"]
+
+          def api(path, payload=None):
+              req = root + path if payload is None else urllib.request.Request(
+                  root + path, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+              with client.open(req, timeout=10) as response:
+                  return json.load(response)
+
+          tomorrow = (date.fromisoformat(state["today"]) + timedelta(days=1)).isoformat()
+          case = api("/api/action/practice", {"mode": "rush"})
+          guide = api("/api/walkthrough?run=" + case["id"])
+          assert guide["rush"] and not guide["ready"]["slot"]
+          line = next(line for line in api("/api/execution/production")["lines"] if line["site_id"] == guide["site_id"])
+          api("/api/action/schedule_work", {"id": guide["work"]["id"], "line_id": line["id"], "day": tomorrow,
+                                           "start": "08:00", "minutes": "90", "note": "排程发布验证"})
+          assert api("/api/walkthrough?run=" + case["id"])["ready"]["slot"]
+          sale = api("/api/document/" + order["id"])
+          batch = next(row for row in state["lots"] if row["code"] == "FG-DEMO-001")
+          api("/api/action/inspect", {"lot_id": batch["id"], "verdict": "released", "note": "验证成品放行"})
+          api("/api/action/reserve_stock", {"id": sale["id"], "lot_id": batch["id"], "quantity": "4", "note": "锁料发布验证"})
+          line_id = sale["lines"][0]["id"]
+          for _ in range(2):
+              api("/api/action/delivery_commitment",
+                  {"id": sale["id"], "line_id": line_id, "quantity": "2", "due": tomorrow, "note": "分批承诺发布验证"})
+          delivery = api("/api/document/" + sale["id"])["commitments"][0]
+          api("/api/action/ship", {"id": sale["id"], "line_id": line_id, "commitment_id": delivery["id"], "quantity": "2"})
+          assert api("/api/industry/transport")["pending"][0]["commitment_id"] == delivery["id"]
+          api("/api/action/dispatch", {"id": sale["id"], "commitment_id": delivery["id"], "due": tomorrow,
+                                      "carrier": "验证承运商", "tracking": "CI-POD-01"})
+          transport = api("/api/industry/transport")["shipments"][0]
+          api("/api/action/sign_shipment", {"id": transport["id"], "receipt": "CI-RECEIPT-01"})
+          assert sum(row["signed"] for row in api("/api/document/" + sale["id"])["commitments"]) == 2000
           PY
 
       - name: 发布镜像并用 Compose 回拉验证

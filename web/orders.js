@@ -95,7 +95,8 @@ async function openExpedite(id) {
   const history=section("跟进记录",table(["动作","说明","操作人","时间"],events,event=>[
     bold(event.action),text(event.note),text(event.actor),text(timestamp(event.created)),
   ]));
-  openGuidedDetail("急单处理 · "+order.ref,header+`<div class="actions">${actions}</div>`+delivery+supply+history);
+  openGuidedDetail("急单处理 · "+order.ref,header+`<div class="actions">${actions}</div>`
+    +delivery+commitmentSection(order,true)+supply+history);
 }
 
 async function expediteSchedule(id) {

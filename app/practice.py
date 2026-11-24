@@ -2,7 +2,8 @@
 
 from datetime import date, timedelta
 
-from erp import audit, eligible, execute, key, now, require, sample_dataset, today
+from erp import audit, eligible, execute, field, key, now, require, sample_dataset, today
+from execution import commitments, new_production_line
 from industry import apply as industry_action
 
 
@@ -10,8 +11,10 @@ def allowed(db,account):
     return account["role"]=="admin" and sample_dataset(db)
 
 
-def launch(db,account):
+def launch(db,account,payload=None):
     require(allowed(db,account),"实操案例仅可在已初始化样例的账套由管理员创建",403)
+    mode=field(payload or {},"mode","实操类型",20,True) or "standard"
+    require(mode in {"standard","rush"},"实操类型无效")
     ident = key()
     code = "PRA-"+ident[:10].upper()
     due = date.fromisoformat(today())
@@ -39,6 +42,10 @@ def launch(db,account):
     industry_action(db,"link_supply",dict(id=work["id"],ref=purchase["ref"]),account)
     db.execute("INSERT INTO practice_runs VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                (ident,code,account["id"],site,product,raw,sale["id"],purchase["id"],work["id"],now()))
+    if mode=="rush":
+        new_production_line(db,{"code":code+"-LN","name":"装配实操产线（三班）","site_id":site,
+                                "shift_start":"00:00","capacity":"1440"},account)
+        db.execute("INSERT INTO practice_rush_runs VALUES (%s)",(ident,))
     audit(db,account,"创建工业实操案例",code,sale["ref"])
     return {"id":ident,"ref":code}
 
@@ -65,7 +72,7 @@ def view(db,ident,account):
                      "WHERE r.receipt_id=m.id),0)),0) AS total FROM movements m JOIN accepted_receipts a "
                      "ON a.movement_id=m.id WHERE m.ref=%s AND m.kind='收货'",(docs["purchase"]["ref"],))["total"]
     worker_code = run["code"]+"-OP"
-    raw_available = sum(lot["quantity"] for lot in eligible(db,run["raw_id"],run["site_id"]))
+    raw_available = sum(lot["quantity"] for lot in eligible(db,run["raw_id"],run["site_id"],run["work_id"]))
     ready = {
         "sale":docs["sale"]["status"] in {"approved","partial","done"},
         "purchase":docs["purchase"]["status"]=="done",
@@ -86,5 +93,20 @@ def view(db,ident,account):
             "FROM trade_invoices f WHERE f.doc_id=%s",(docs[name]["id"],),
         )
         ready["finance_"+name] = sum(row["quantity"] for row in invoices)>=quantity and all(row["settled"]==row["amount"] for row in invoices)
-    return dict(**docs,run_id=ident,code=run["code"],site_id=run["site_id"],worker_code=worker_code,
+    rush=bool(db.one("SELECT 1 FROM practice_rush_runs WHERE run_id=%s",(ident,)))
+    if rush:
+        ticket=db.one("SELECT status FROM expedite_orders WHERE doc_id=%s",(run["sale_id"],))
+        splits=[row for row in commitments(db,run["sale_id"]) if not row["cancelled"]]
+        def locked(order_id):
+            return db.one("SELECT COALESCE(SUM(quantity),0) AS n FROM stock_reservations WHERE doc_id=%s",(order_id,))["n"]
+        shipped=db.one("SELECT fulfilled FROM document_lines WHERE doc_id=%s",(run["sale_id"],))["fulfilled"]
+        ready.update({
+            "rush":bool(ticket and ticket["status"] in {"open","closed"}),
+            "commitments":len(splits)>=2 and sum(row["quantity"] for row in splits)==4000,
+            "raw_lock":locked(run["work_id"])>=8000 or docs["work"]["status"] in {"running","done"},
+            "slot":bool(db.one("SELECT 1 FROM work_slots WHERE doc_id=%s",(run["work_id"],))),
+            "product_lock":locked(run["sale_id"])+shipped>=4000,
+            "rush_close":bool(ticket and ticket["status"]=="closed"),
+        })
+    return dict(**docs,run_id=ident,code=run["code"],site_id=run["site_id"],worker_code=worker_code,rush=rush,
                 raw=raw,product=product,batch=batch,ready=ready)

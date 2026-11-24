@@ -189,3 +189,40 @@ CREATE TABLE IF NOT EXISTS delivery_revisions (
   actor TEXT NOT NULL, created TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS delivery_revisions_order ON delivery_revisions(doc_id,created);
+CREATE TABLE IF NOT EXISTS stock_reservations (
+  doc_id TEXT NOT NULL REFERENCES documents(id), site_id TEXT NOT NULL REFERENCES sites(id),
+  lot_id TEXT NOT NULL REFERENCES lots(id), quantity BIGINT NOT NULL CHECK(quantity>0),
+  PRIMARY KEY(doc_id,lot_id)
+);
+CREATE INDEX IF NOT EXISTS stock_reservations_batch ON stock_reservations(site_id,lot_id);
+CREATE TABLE IF NOT EXISTS production_lines (
+  id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+  site_id TEXT NOT NULL REFERENCES sites(id),
+  shift_start INTEGER NOT NULL CHECK(shift_start>=0 AND shift_start<1440),
+  capacity INTEGER NOT NULL CHECK(capacity>0 AND shift_start+capacity<=1440)
+);
+CREATE TABLE IF NOT EXISTS production_calendar (
+  line_id TEXT NOT NULL REFERENCES production_lines(id), day TEXT NOT NULL,
+  capacity INTEGER NOT NULL CHECK(capacity>=0 AND capacity<=1440),
+  PRIMARY KEY(line_id,day)
+);
+CREATE TABLE IF NOT EXISTS work_slots (
+  doc_id TEXT PRIMARY KEY REFERENCES documents(id), line_id TEXT NOT NULL REFERENCES production_lines(id),
+  day TEXT NOT NULL, start_minute INTEGER NOT NULL CHECK(start_minute>=0),
+  minutes INTEGER NOT NULL CHECK(minutes>0 AND start_minute+minutes<=1440)
+);
+CREATE INDEX IF NOT EXISTS work_slots_window ON work_slots(line_id,day,start_minute);
+CREATE TABLE IF NOT EXISTS delivery_commitments (
+  id TEXT PRIMARY KEY, ref TEXT NOT NULL UNIQUE,
+  line_id TEXT NOT NULL REFERENCES document_lines(id), quantity BIGINT NOT NULL CHECK(quantity>0),
+  due TEXT NOT NULL, note TEXT NOT NULL, cancelled INTEGER NOT NULL DEFAULT 0 CHECK(cancelled IN (0,1))
+);
+CREATE INDEX IF NOT EXISTS delivery_commitments_line ON delivery_commitments(line_id);
+CREATE TABLE IF NOT EXISTS delivery_movements (
+  movement_id TEXT PRIMARY KEY REFERENCES movements(id),
+  commitment_id TEXT NOT NULL REFERENCES delivery_commitments(id)
+);
+CREATE INDEX IF NOT EXISTS delivery_movements_commitment ON delivery_movements(commitment_id);
+CREATE TABLE IF NOT EXISTS practice_rush_runs (
+  run_id TEXT PRIMARY KEY REFERENCES practice_runs(id)
+);

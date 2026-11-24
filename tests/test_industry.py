@@ -1,8 +1,10 @@
 import json
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 import test_workflows
+from erp import ERP_ZONE
 
 
 class IndustrialWorkflowTests(unittest.TestCase):
@@ -141,10 +143,18 @@ class IndustrialWorkflowTests(unittest.TestCase):
         self.assertEqual(traced["stock"][0]["quantity"],3000)
 
     def test_practice_gates_follow_the_real_draft_to_close_workflow(self):
-        launch = self.call("/api/action/practice",{},token="practice-doubleclick-1")
-        self.assertEqual(launch,self.call("/api/action/practice",{},token="practice-doubleclick-1"))
+        self.complete_practice({})
+
+    def test_rush_practice_follows_lock_schedule_and_split_delivery(self):
+        self.complete_practice({"mode":"rush"})
+
+    def complete_practice(self, options):
+        rush=options.get("mode")=="rush"
+        launch = self.call("/api/action/practice",options,token="practice-doubleclick-1")
+        self.assertEqual(launch,self.call("/api/action/practice",options,token="practice-doubleclick-1"))
         path = "/api/walkthrough?run="+launch["id"]
         progress = self.call(path)
+        self.assertEqual(progress["rush"],rush)
         self.assertFalse(any(progress["ready"].values()))
         self.assertEqual(self.call("/api/walkthrough")["latest"]["id"],launch["id"])
         sale,purchase,work = (progress[name]["id"] for name in ("sale","purchase","work"))
@@ -154,6 +164,13 @@ class IndustrialWorkflowTests(unittest.TestCase):
             self.act("approve",id=ident,decision="approve")
         purchase_line = orders[purchase]["lines"][0]["id"]
         sale_line = orders[sale]["lines"][0]["id"]
+        if rush:
+            self.act("expedite",id=sale,operation="schedule",priority="critical",owner="交付负责人",
+                     due=self.fixture.ahead(2),note="提前安装")
+            for offset in (1,2):
+                self.act("delivery_commitment",id=sale,line_id=sale_line,quantity="2",
+                         due=self.fixture.ahead(offset),note="确认分批")
+            self.assertTrue(self.call(path)["ready"]["commitments"])
         self.act("receive",id=purchase,line_id=purchase_line,quantity="8",lot=launch["ref"]+"-RAW")
         pending = self.call(path)["ready"]
         self.assertTrue(pending["sale"] and pending["purchase"])
@@ -163,7 +180,20 @@ class IndustrialWorkflowTests(unittest.TestCase):
         self.act("inspect",lot_id=receipt["lot_id"],verdict="released",note="来料检验记录")
         self.act("personnel",code=progress["worker_code"],name="案例装配员",team="装配班")
         worker = next(row for row in self.call("/api/industry/people")["people"] if row["code"]==progress["worker_code"])
-        self.act("start",id=work)
+        if rush:
+            self.act("reserve_stock",id=work,lot_id=receipt["lot_id"],quantity="8",note="毛坯齐套")
+            self.assertTrue(self.call(path)["ready"]["raw_lock"])
+            day=self.fixture.ahead(0)
+            line_id=next(row["id"] for row in self.call("/api/execution/production")["lines"] if row["site_id"]==progress["site_id"])
+            moment=datetime.fromisoformat(day+"T12:01").replace(tzinfo=ERP_ZONE)
+            with patch("erp.datetime") as clock, patch("execution.datetime") as scheduler:
+                clock.now.return_value=moment
+                scheduler.now.return_value=moment
+                self.act("schedule_work",id=work,line_id=line_id,day=day,start="12:00",minutes="60",note="急单占用时段")
+                self.act("start",id=work)
+            self.assertFalse(self.call("/api/document/"+work)["reservations"])
+        else:
+            self.act("start",id=work)
         steps = orders[work]["steps"]
         self.act("report",409,id=work,step_id=steps[0]["id"],minutes="15")
         for step in steps:
@@ -175,10 +205,21 @@ class IndustrialWorkflowTests(unittest.TestCase):
         self.act("ship",409,id=sale,line_id=sale_line,quantity="4")
         self.act("inspect",lot_id=batch["id"],verdict="released",note="成品质检记录")
         self.act("inventory_count",site_id=progress["site_id"],lot_id=batch["id"],book="4",counted="4",reason="实操盘点")
-        self.act("ship",id=sale,line_id=sale_line,quantity="4")
-        self.act("dispatch",id=sale,carrier="实操物流",tracking=launch["ref"]+"-T",due=self.fixture.ahead(1))
-        shipment = next(row for row in self.call("/api/industry/transport")["shipments"] if row["doc_id"]==sale)
-        self.act("sign_shipment",id=shipment["id"],receipt="实操签收回单")
+        splits=[({}, "4")]
+        if rush:
+            self.act("reserve_stock",id=sale,lot_id=batch["id"],quantity="4",note="成品锁给急单")
+            self.assertTrue(self.call(path)["ready"]["product_lock"])
+            splits=[({"commitment_id":row["id"]},"2") for row in self.call("/api/document/"+sale)["commitments"]]
+        for index,(split,qty) in enumerate(splits):
+            self.act("ship",id=sale,line_id=sale_line,quantity=qty,**split)
+            tracking=launch["ref"]+"-T"+str(index)
+            self.act("dispatch",id=sale,carrier="实操物流",tracking=tracking,due=self.fixture.ahead(1),**split)
+            shipment=next(row for row in self.call("/api/industry/transport")["shipments"] if row["tracking"]==tracking)
+            self.act("sign_shipment",id=shipment["id"],receipt="实操签收回单")
+            if rush and index==0:
+                self.act("expedite",409,id=sale,operation="close",note="第二批待签收")
+        if rush:
+            self.act("expedite",id=sale,operation="close",note="两张签收凭证齐全")
         for ident,line,quantity,price,total,direction in (
             (purchase,purchase_line,"8","32","256","ap"),(sale,sale_line,"4","465","1860","ar"),
         ):

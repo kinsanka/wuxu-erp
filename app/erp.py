@@ -253,6 +253,11 @@ def approve(db, data, account):
     require(action == "cancel" or doc["status"] == "draft", "单据已经审核", 409)
     status = "approved" if action == "approve" else "cancelled"
     db.execute("UPDATE documents SET status=%s WHERE id=%s", (status, doc["id"]))
+    if status=="cancelled":
+        db.execute("DELETE FROM stock_reservations WHERE doc_id=%s",(doc["id"],))
+        db.execute("DELETE FROM work_slots WHERE doc_id=%s",(doc["id"],))
+        db.execute("UPDATE delivery_commitments SET cancelled=1 WHERE line_id IN "
+                   "(SELECT id FROM document_lines WHERE doc_id=%s)",(doc["id"],))
     audit(db, account, "审核通过" if status == "approved" else "取消单据", doc["ref"], note(data))
     return {"ref": doc["ref"]}
 
@@ -261,6 +266,9 @@ def post(db, lot, site, quantity, kind, ref, account, detail=""):
     balance = db.one("SELECT quantity FROM stock WHERE lot_id=%s AND site_id=%s", (lot, site))
     new = (balance["quantity"] if balance else 0) + quantity
     require(new >= 0, "库存不足", 409)
+    if quantity<0:
+        held=db.one("SELECT COALESCE(SUM(quantity),0) AS n FROM stock_reservations WHERE site_id=%s AND lot_id=%s",(site,lot))["n"]
+        require(new>=held,"出库将占用已锁定的库存，请先处理预留",409)
     db.execute("INSERT INTO stock VALUES (%s,%s,%s) ON CONFLICT (lot_id,site_id) DO UPDATE SET quantity=excluded.quantity",
                (lot, site, new))
     ident = key()
@@ -326,21 +334,60 @@ def find_unit(db, raw, verify=True):
     return db.one("SELECT * FROM units WHERE code=%s", (code,))
 
 
-def eligible(db, item, site):
-    return db.all("SELECT s.quantity,l.id,l.code,l.expiry FROM stock s JOIN lots l ON l.id=s.lot_id WHERE l.item_id=%s AND s.site_id=%s AND s.quantity>0 "
+def eligible(db, item, site, owner=""):
+    return db.all("SELECT CAST(s.quantity-COALESCE(r.total,0)+COALESCE(r.own,0) AS BIGINT) AS quantity,"
+                  "CAST(COALESCE(r.own,0) AS BIGINT) AS reserved,l.id,l.code,l.expiry FROM stock s JOIN lots l ON l.id=s.lot_id "
+                  "LEFT JOIN (SELECT lot_id,SUM(quantity) AS total,"
+                  "SUM(CASE WHEN doc_id=%s THEN quantity ELSE 0 END) AS own "
+                  "FROM stock_reservations WHERE site_id=%s GROUP BY lot_id) r ON r.lot_id=l.id "
+                  "WHERE l.item_id=%s AND s.site_id=%s AND s.quantity>COALESCE(r.total,0)-COALESCE(r.own,0) "
                   "AND l.status='released' AND (l.expiry IS NULL OR l.expiry >= %s) ORDER BY CASE WHEN l.expiry IS NULL THEN 1 ELSE 0 END,l.expiry,l.created,l.id",
-                  (item, site, today()))
+                  (owner,site,item,site,today()))
 
 
-def allocate(db, item, site, quantity):
-    remaining, chosen = quantity, []
-    for lot in eligible(db, item, site):
-        amount = min(remaining, lot["quantity"])
-        chosen.append((lot["id"], amount))
-        remaining -= amount
-        if not remaining:
-            return chosen
-    raise BusinessError("可用库存不足，请检查效期与批次状态", 409)
+def allocate(db, item, site, quantity, owner):
+    invalid=db.one(
+        "SELECT l.id FROM stock_reservations r JOIN lots l ON l.id=r.lot_id "
+        "WHERE r.doc_id=%s AND l.item_id=%s AND (l.status<>'released' OR (l.expiry IS NOT NULL AND l.expiry<%s))",
+        (owner,item,today()),
+    )
+    require(not invalid,"本单预留批次未放行或已过期，请先释放并重新锁料",409)
+    lots=eligible(db,item,site,owner)
+    remaining,chosen=quantity,{}
+    for bucket in ("reserved","free"):
+        for lot in lots:
+            available=lot["reserved"] if bucket=="reserved" else lot["quantity"]-lot["reserved"]
+            amount=min(remaining,available)
+            if amount:
+                chosen[lot["id"]]=chosen.get(lot["id"],0)+amount
+                remaining-=amount
+            if not remaining:
+                return chosen.items()
+    raise BusinessError("可用库存不足，请检查其他单据预留、效期与批次状态",409)
+
+
+def consume_reserved(db, order_id, lot_id, amount):
+    reservation=db.one("SELECT quantity FROM stock_reservations WHERE doc_id=%s AND lot_id=%s",(order_id,lot_id))
+    if reservation:
+        if reservation["quantity"]<=amount:
+            db.execute("DELETE FROM stock_reservations WHERE doc_id=%s AND lot_id=%s",(order_id,lot_id))
+        else:
+            db.execute("UPDATE stock_reservations SET quantity=quantity-%s WHERE doc_id=%s AND lot_id=%s",
+                       (amount,order_id,lot_id))
+
+
+def shipping_commitment(db,line,data,quantity):
+    ident=field(data,"commitment_id","交付承诺",64,True)
+    if not ident:
+        require(not db.one("SELECT 1 FROM delivery_commitments WHERE line_id=%s AND cancelled=0",(line["id"],)),
+                "该明细有分批承诺，请选择本次发货对应批次",409)
+        return None
+    commitment=db.one("SELECT * FROM delivery_commitments WHERE id=%s AND line_id=%s AND cancelled=0",(ident,line["id"]))
+    require(commitment,"交付承诺不存在、已撤销或不属于该销售明细",409)
+    sent=db.one("SELECT COALESCE(SUM(-m.quantity),0) AS n FROM delivery_movements x "
+                "JOIN movements m ON m.id=x.movement_id WHERE x.commitment_id=%s",(ident,))["n"]
+    require(quantity<=commitment["quantity"]-sent,"发货数量超过本批承诺未发量",409)
+    return ident
 
 
 def complete_trade(db, data, account, kind):
@@ -370,8 +417,12 @@ def complete_trade(db, data, account, kind):
         if not item["quality"]:
             db.execute("INSERT INTO accepted_receipts VALUES (%s,%s)",(receipt,now()))
     else:
-        for lot, amount in allocate(db, item["id"], doc["site_id"], qty):
-            post(db, lot, doc["site_id"], -amount, "销售发货", doc["ref"], account, note(data))
+        commitment=shipping_commitment(db,line,data,qty)
+        for lot, amount in allocate(db,item["id"],doc["site_id"],qty,doc["id"]):
+            consume_reserved(db,doc["id"],lot,amount)
+            movement=post(db,lot,doc["site_id"],-amount,"销售发货",doc["ref"],account,note(data))
+            if commitment:
+                db.execute("INSERT INTO delivery_movements VALUES (%s,%s)",(movement,commitment))
     db.execute("UPDATE document_lines SET fulfilled=fulfilled+%s WHERE id=%s", (qty, line["id"]))
     has_open = db.one("SELECT id FROM document_lines WHERE doc_id=%s AND fulfilled<quantity", (doc["id"],))
     db.execute("UPDATE documents SET status=%s WHERE id=%s", ("partial" if has_open else "done", doc["id"]))
@@ -444,10 +495,11 @@ def plan(db, doc):
         supply.setdefault(purchase["item_id"], []).append(purchase)
     result = []
     for row in requirements(db, doc, line):
-        site_stock = sum(lot["quantity"] for lot in eligible(db, row["item_id"], doc["site_id"]))
+        lot_choices = eligible(db,row["item_id"],doc["site_id"],doc["id"])
+        site_stock = sum(lot["quantity"] for lot in lot_choices)
         purchases = supply.get(row["item_id"], [])
         incoming = sum(purchase["remaining"] for purchase in purchases if purchase["schedule"]=="scheduled")
-        row.update(available=site_stock, incoming=incoming, shortage=max(0,row["required"]-site_stock),
+        row.update(available=site_stock,reserved=sum(lot["reserved"] for lot in lot_choices), incoming=incoming, shortage=max(0,row["required"]-site_stock),
                    net=max(0,row["required"]-site_stock-incoming), draft=int(linked_drafts.get(row["item_id"],0)),purchases=purchases)
         result.append(row)
     return result
@@ -455,11 +507,18 @@ def plan(db, doc):
 
 def start_work(db, data, account):
     doc = doc_for(db, data, {"work"}, {"approved"})
+    slot=db.one("SELECT day,start_minute,minutes FROM work_slots WHERE doc_id=%s",(doc["id"],))
+    if slot:
+        local=datetime.now(ERP_ZONE)
+        current=local.hour*60+local.minute
+        require(local.date().isoformat()==slot["day"] and slot["start_minute"]<=current<slot["start_minute"]+slot["minutes"],
+                "当前不在预定生产时段，请调整排程后再开工",409)
     line = db.one("SELECT * FROM document_lines WHERE doc_id=%s", (doc["id"],))
     for row in requirements(db, doc, line):
-        require(sum(lot["quantity"] for lot in eligible(db,row["item_id"],doc["site_id"])) >= row["required"],
+        require(sum(lot["quantity"] for lot in eligible(db,row["item_id"],doc["site_id"],doc["id"])) >= row["required"],
                 f"领料失败：{row['name']}可用数量不足", 409)
-        for lot, amount in allocate(db, row["item_id"], doc["site_id"], row["required"]):
+        for lot, amount in allocate(db,row["item_id"],doc["site_id"],row["required"],doc["id"]):
+            consume_reserved(db,doc["id"],lot,amount)
             post(db, lot, doc["site_id"], -amount, "生产领料", doc["ref"], account)
     db.execute("UPDATE documents SET status='running' WHERE id=%s", (doc["id"],))
     audit(db, account, "领料开工", doc["ref"])
