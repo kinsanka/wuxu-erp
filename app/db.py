@@ -58,3 +58,13 @@ def initialize(db):
     for statement in (ROOT / "schema.sql").read_text().split(";"):
         if statement.strip():
             db.execute(statement)
+    if not db.one("SELECT value FROM settings WHERE key='accepted_receipts_v1'"):
+        db.execute(
+            "INSERT INTO accepted_receipts(movement_id,accepted) "
+            "SELECT m.id,COALESCE((SELECT MIN(e.created) FROM inspections e WHERE e.lot_id=l.id "
+            "AND e.verdict='released' AND e.created>=m.created),m.created) FROM movements m "
+            "JOIN lots l ON l.id=m.lot_id JOIN items i ON i.id=l.item_id WHERE m.kind='收货' "
+            "AND (i.quality=0 OR l.status='released' OR EXISTS (SELECT 1 FROM inspections e WHERE e.lot_id=l.id "
+            "AND e.verdict='released' AND e.created>=m.created)) ON CONFLICT(movement_id) DO NOTHING"
+        )
+        db.execute("INSERT INTO settings VALUES ('accepted_receipts_v1','1')")

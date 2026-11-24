@@ -9,7 +9,11 @@ from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-DEMO = os.getenv("ERP_DEMO", "1") == "1"
+SEED_EXAMPLES = os.getenv("ERP_DEMO", "1") == "1"
+DEMO_LOGIN = os.getenv("ERP_DEMO_LOGIN") == "1"
+ADMIN_ACCOUNT_ID = "administrator"
+LEGACY_DEMO_ACCOUNT_ID = "wuxu-demo-account"
+DEMO_CREDENTIALS = {"username": "admin", "password": "wuxu-demo"}
 ERP_ZONE = ZoneInfo(os.getenv("ERP_TIMEZONE", "Asia/Shanghai"))
 ROLES = {"admin", "planner", "warehouse", "clinical", "viewer"}
 WORKFLOW = {
@@ -101,23 +105,54 @@ def session_key(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def sample_dataset(db):
+    setting = db.one("SELECT value FROM settings WHERE key='demo'")
+    return bool(setting and setting["value"]=="1")
+
+
+def demo_login_enabled(db):
+    return DEMO_LOGIN and sample_dataset(db)
+
+
 def authenticate(db, token):
-    if not token or not re.fullmatch(r"[a-f0-9]{64}", token):
+    if not token or not re.fullmatch(r"(?:demo-)?[a-f0-9]{64}", token):
         return None
-    return db.one(
+    demo_session = token.startswith("demo-")
+    if demo_session != demo_login_enabled(db):
+        return None
+    account = db.one(
         "SELECT u.id,u.username,u.name,u.role FROM sessions s JOIN users u ON u.id=s.user_id "
         "WHERE s.token=%s AND s.expires>%s AND u.enabled=1", (session_key(token), int(time.time())),
     )
+    if not account or account["id"] == LEGACY_DEMO_ACCOUNT_ID:
+        return None
+    if demo_session:
+        if account["id"] != ADMIN_ACCOUNT_ID:
+            return None
+        account["is_demo"] = True
+    return account
 
 
 def login(db, data):
     username = field(data, "username", "账号", 60).lower()
     password = field(data, "password", "密码", 160)
-    account = db.one("SELECT * FROM users WHERE username=%s AND enabled=1", (username,))
+    if demo_login_enabled(db):
+        require({"username": username, "password": password} == DEMO_CREDENTIALS,
+                "请使用预填的演示账号登录", 401)
+        account = db.one("SELECT id FROM users WHERE id=%s AND enabled=1", (ADMIN_ACCOUNT_ID,))
+        require(account, "演示账号不可用", 403)
+        return create_session(db, account["id"], demo=True)
+    account = db.one("SELECT id,password FROM users WHERE username=%s AND enabled=1 AND id<>%s",
+                     (username, LEGACY_DEMO_ACCOUNT_ID))
     require(account and password_matches(password, account["password"]), "账号或密码错误", 401)
-    token = secrets.token_hex(32)
-    db.execute("DELETE FROM sessions WHERE expires <= %s", (int(time.time()),))
-    db.execute("INSERT INTO sessions VALUES (%s,%s,%s)", (session_key(token), account["id"], int(time.time()) + 43200))
+    return create_session(db, account["id"])
+
+
+def create_session(db, account_id, demo=False):
+    token = ("demo-" if demo else "") + secrets.token_hex(32)
+    current = int(time.time())
+    db.execute("DELETE FROM sessions WHERE expires <= %s", (current,))
+    db.execute("INSERT INTO sessions VALUES (%s,%s,%s)", (session_key(token), account_id, current + 43200))
     return token
 
 
@@ -217,8 +252,10 @@ def post(db, lot, site, quantity, kind, ref, account, detail=""):
     require(new >= 0, "库存不足", 409)
     db.execute("INSERT INTO stock VALUES (%s,%s,%s) ON CONFLICT (lot_id,site_id) DO UPDATE SET quantity=excluded.quantity",
                (lot, site, new))
+    ident = key()
     db.execute("INSERT INTO movements VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-               (key(), lot, site, quantity, kind, ref, account["username"], now(), detail))
+               (ident, lot, site, quantity, kind, ref, account["username"], now(), detail))
+    return ident
 
 
 def new_lot(db, item, code, expiry, new_only=False, pending=False):
@@ -319,7 +356,9 @@ def complete_trade(db, data, account, kind):
                     require("17" not in gs or (expiry and expiry[2:].replace("-","") == gs["17"]), "扫描码效期与收货资料不一致")
                 require(not find_unit(db, raw, verify=False), f"包装码已登记 {code}", 409)
                 db.execute("INSERT INTO units VALUES (%s,%s,%s,%s,%s,'stock')", (key(), code, gs.get("21"), lot, doc["site_id"]))
-        post(db, lot, doc["site_id"], qty, "收货", doc["ref"], account, note(data))
+        receipt = post(db, lot, doc["site_id"], qty, "收货", doc["ref"], account, note(data))
+        if not item["quality"]:
+            db.execute("INSERT INTO accepted_receipts VALUES (%s,%s)",(receipt,now()))
     else:
         for lot, amount in allocate(db, item["id"], doc["site_id"], qty):
             post(db, lot, doc["site_id"], -amount, "销售发货", doc["ref"], account, note(data))
@@ -374,15 +413,27 @@ def requirements(db, doc, line):
 
 def plan(db, doc):
     line = db.one("SELECT * FROM document_lines WHERE doc_id=%s", (doc["id"],))
+    current = today()
+    supply = {}
+    for purchase in db.all(
+        "SELECT d.id,d.ref,d.due,p.name AS supplier,l.item_id,l.quantity-l.fulfilled AS remaining "
+        "FROM documents d JOIN document_lines l ON l.doc_id=d.id JOIN bom_lines b ON b.item_id=l.item_id "
+        "LEFT JOIN partners p ON p.id=d.partner_id WHERE b.bom_id=%s AND d.site_id=%s AND d.kind='purchase' "
+        "AND d.status IN ('approved','partial') AND l.quantity>l.fulfilled "
+        "ORDER BY CASE WHEN d.due IS NULL THEN 1 ELSE 0 END,d.due,d.created",
+        (doc["bom_id"],doc["site_id"]),
+    ):
+        due = purchase["due"]
+        purchase["schedule"] = ("undated" if not due else "overdue" if due<current else
+                                "late" if doc["due"] and due>doc["due"] else "scheduled")
+        supply.setdefault(purchase["item_id"], []).append(purchase)
     result = []
     for row in requirements(db, doc, line):
         site_stock = sum(lot["quantity"] for lot in eligible(db, row["item_id"], doc["site_id"]))
-        pending = db.one("SELECT COALESCE(SUM(l.quantity-l.fulfilled),0) AS qty FROM document_lines l JOIN documents d ON d.id=l.doc_id "
-                         "WHERE l.item_id=%s AND d.site_id=%s AND d.kind='purchase' AND d.status IN ('approved','partial')"
-                         " AND (d.due IS NULL OR d.due<=%s)",
-                         (row["item_id"], doc["site_id"], doc["due"] or "9999-12-31"))
-        row.update(available=site_stock, incoming=int(pending["qty"]), shortage=max(0,row["required"]-site_stock),
-                   net=max(0, row["required"]-site_stock-int(pending["qty"])))
+        purchases = supply.get(row["item_id"], [])
+        incoming = sum(purchase["remaining"] for purchase in purchases if purchase["schedule"]=="scheduled")
+        row.update(available=site_stock, incoming=incoming, shortage=max(0,row["required"]-site_stock),
+                   net=max(0,row["required"]-site_stock-incoming), purchases=purchases)
         result.append(row)
     return result
 
@@ -407,6 +458,9 @@ def report_work(db, data, account):
     next_step = db.one("SELECT b.id FROM bom_steps b LEFT JOIN work_steps w ON w.step_id=b.id AND w.doc_id=%s "
                        "WHERE b.bom_id=%s AND w.step_id IS NULL ORDER BY b.step_no LIMIT 1", (doc["id"], doc["bom_id"]))
     require(next_step and next_step["id"] == step["id"], "请按 BOM 工序顺序报工", 409)
+    if db.one("SELECT 1 FROM practice_runs WHERE work_id=%s",(doc["id"],)):
+        require(db.one("SELECT 1 FROM work_assignments WHERE doc_id=%s AND step_id=%s",(doc["id"],step["id"])),
+                "实操案例请先为本工序派工",409)
     minutes = scaled(data, "minutes", "工时分钟", 1)
     require(minutes <= 100000, "工时超过上限")
     db.execute("INSERT INTO work_steps VALUES (%s,%s,%s,%s,%s,%s)",
@@ -443,7 +497,12 @@ def inspect(db, data, account):
     require(lot["status"] != verdict, "批次已经处于该状态", 409)
     require(verdict != "released" or not lot["expiry"] or lot["expiry"] >= today(), "过效期批次不能放行", 409)
     db.execute("UPDATE lots SET status=%s WHERE id=%s", (verdict,lot["id"]))
-    db.execute("INSERT INTO inspections VALUES (%s,%s,%s,%s,%s,%s)", (key(),lot["id"],verdict,reason,account["username"],now()))
+    inspected = now()
+    db.execute("INSERT INTO inspections VALUES (%s,%s,%s,%s,%s,%s)", (key(),lot["id"],verdict,reason,account["username"],inspected))
+    if verdict=="released":
+        db.execute("INSERT INTO accepted_receipts(movement_id,accepted) "
+                   "SELECT id,%s FROM movements WHERE lot_id=%s AND kind='收货' ON CONFLICT(movement_id) DO NOTHING",
+                   (inspected,lot["id"]))
     audit(db,account,{"released":"质检放行","blocked":"冻结批次","pending":"隔离批次"}[verdict],lot["code"],reason)
     return {"ref": lot["code"]}
 
@@ -548,5 +607,6 @@ ACTIONS = {
 
 def execute(db,action,data,account):
     require(action in ACTIONS,"操作不存在",404)
+    require(not account.get("is_demo") or action not in {"user","password"}, "演示账号无权管理账号", 403)
     require(account["role"]=="admin" or account["role"] in WORKFLOW[action],"当前角色无操作权限",403)
     return ACTIONS[action](db,data,account)

@@ -1,18 +1,21 @@
 import os
+import secrets
 from datetime import date, timedelta
 
-from erp import DEMO, execute, password_hash, today
+from erp import ADMIN_ACCOUNT_ID, SEED_EXAMPLES, demo_login_enabled, execute, password_hash, today
+from industry import apply as industry_action
 
-ADMIN={"id":"administrator","username":"admin","name":"系统管理员","role":"admin"}
+ADMIN={"id":ADMIN_ACCOUNT_ID,"username":"admin","name":"系统管理员","role":"admin"}
 
 
 def bootstrap(db):
     current=db.one("SELECT value FROM settings WHERE key='demo'")
     if current:
-        if current["value"] != str(int(DEMO)):
-            raise RuntimeError("ERP_DEMO 与当前数据库模式不一致，请为正式库使用独立项目和数据卷。")
         return
+    db.execute("INSERT INTO settings VALUES ('demo',%s)",(str(int(SEED_EXAMPLES)),))
     password=os.getenv("ERP_ADMIN_PASSWORD","").strip()
+    if not password and demo_login_enabled(db):
+        password=secrets.token_urlsafe(24)
     if os.getenv("ERP_POSTGRES") == "1":
         db_password=os.getenv("PGPASSWORD","")
         if len(db_password)<14 or db_password==password:
@@ -27,9 +30,8 @@ def bootstrap(db):
         ("clinical","H02","手术室二级库","clinical"),
     ):
         db.execute("INSERT INTO sites VALUES (%s,%s,%s,%s)",(ident,code,name,kind))
-    if DEMO:
+    if SEED_EXAMPLES:
         seed_demo(db)
-    db.execute("INSERT INTO settings VALUES ('demo',%s)",(str(int(DEMO)),))
 
 
 def seed_demo(db):
@@ -80,10 +82,14 @@ def seed_demo(db):
     bom=action("bom",item_id="module",version="A.01",lines=[
         {"item_id":"al","quantity":"2.250"},{"item_id":"screw","quantity":"6"},{"item_id":"bearing","quantity":"1"}],
         steps=[{"name":"机加工"},{"name":"部件装配"}])["id"]
-    work=action("work",bom_id=bom,site_id="factory",quantity="4",due=date_ahead(3))["id"]
+    completed_work=action("work",bom_id=bom,site_id="factory",quantity="4",due=date_ahead(3))
+    work=completed_work["id"]
     action("approve",id=work,decision="approve")
     action("start",id=work)
+    industry_action(db,"personnel",dict(code="OP-DEMO-01",name="示例操作员",team="总装一班"),ADMIN)
+    worker=db.one("SELECT id FROM personnel WHERE code='OP-DEMO-01'")["id"]
     for step in db.all("SELECT id FROM bom_steps WHERE bom_id=%s ORDER BY step_no",(bom,)):
+        industry_action(db,"assign_step",dict(id=work,step_id=step["id"],person_id=worker),ADMIN)
         action("report",id=work,step_id=step["id"],minutes="25")
     action("finish",id=work,lot="FG-DEMO-001")
     work=action("work",bom_id=bom,site_id="factory",quantity="24",due=date_ahead(5),note="演示计划，用于查看当前缺料与预计未交量")["id"]
@@ -91,3 +97,7 @@ def seed_demo(db):
 
     sale=action("sale",partner_id="customer",site_id="factory",due=date_ahead(6),lines=[{"item_id":"module","quantity":"4","price":"465.00"}])
     action("approve",id=sale["id"],decision="approve")
+    source=db.one("SELECT ref FROM documents WHERE id=%s",(industrial,))["ref"]
+    industry_action(db,"link_supply",dict(id=work,ref=source),ADMIN)
+    industry_action(db,"link_supply",dict(id=completed_work["id"],ref=source),ADMIN)
+    industry_action(db,"link_supply",dict(id=sale["id"],ref=completed_work["ref"]),ADMIN)

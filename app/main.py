@@ -16,10 +16,12 @@ from threading import Lock
 from urllib.parse import parse_qs, urlsplit
 
 from db import POSTGRES, initialize, transaction
-from erp import BusinessError, DEMO, authenticate, execute, login, require, session_key
+from erp import BusinessError, DEMO_CREDENTIALS, authenticate, demo_login_enabled, execute, login, require, sample_dataset, session_key
 from exercise import apply as apply_exercise, view as view_exercise
 from exercise_demo import build_demo
-from read import EXPORTS, bom_detail, document, state, trace
+from industry import OPERATIONS as INDUSTRIAL_OPERATIONS, apply as apply_industry, view as view_industry
+from practice import allowed as practice_allowed, latest as latest_practice, launch as launch_practice, view as view_practice
+from read import EXPORTS, bom_detail, document, item_detail, state, trace, walkthrough_targets
 from seed import bootstrap
 
 WEB = Path(__file__).resolve().parent.parent / "web"
@@ -27,10 +29,12 @@ SECURE_COOKIE = os.getenv("ERP_SECURE_COOKIE","0") == "1"
 STATIC = {"/": ("index.html","text/html; charset=utf-8"), "/style.css": ("style.css","text/css; charset=utf-8"),
           "/app.js": ("app.js","text/javascript; charset=utf-8"),
           "/exercise.js": ("exercise.js","text/javascript; charset=utf-8"),
-          "/exercise_demo.js": ("exercise_demo.js","text/javascript; charset=utf-8")}
+          "/exercise_demo.js": ("exercise_demo.js","text/javascript; charset=utf-8"),
+          "/walkthrough.js": ("walkthrough.js","text/javascript; charset=utf-8"),
+          "/industry.js": ("industry.js","text/javascript; charset=utf-8")}
 IDEMPOTENT_ACTIONS = {
     "master","purchase","sale","approve","receive","ship","bom","work",
-    "start","report","finish","inspect","transfer","use","billing","exercise",
+    "start","report","finish","inspect","transfer","use","billing","exercise","practice", *INDUSTRIAL_OPERATIONS,
 }
 LOGIN_ATTEMPTS = {}
 ATTEMPT_LOCK = Lock()
@@ -71,6 +75,10 @@ def csv_export(db,kind,account):
 def perform(db,action,payload,account):
     if action=="exercise":
         return apply_exercise(db,payload,account)
+    if action=="practice":
+        return launch_practice(db,account)
+    if action in INDUSTRIAL_OPERATIONS:
+        return apply_industry(db,action,payload,account)
     return execute(db,action,payload,account)
 
 
@@ -158,7 +166,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response({"ok":True,"db":"postgresql" if POSTGRES else "sqlite"})
                 return
             if not write and path=="/api/meta":
-                self.json_response({"demo": DEMO})
+                with transaction() as db:
+                    result={"demo":sample_dataset(db),"demo_login":demo_login_enabled(db)}
+                    if result["demo_login"]:
+                        result["demo_account"]=DEMO_CREDENTIALS
+                self.json_response(result)
                 return
             require(path.startswith("/api/"),"页面不存在",404)
             payload=self.payload() if write else {}
@@ -190,10 +202,20 @@ class Handler(BaseHTTPRequestHandler):
                     result=view_exercise(db,account)
                 elif path=="/api/state":
                     result=state(db,account)
+                elif path=="/api/walkthrough":
+                    run=parse_qs(parsed.query).get("run",[""])[0]
+                    result=view_practice(db,run,account) if run else dict(
+                        walkthrough_targets(db),practice_allowed=practice_allowed(db,account),latest=latest_practice(db,account),
+                    )
+                elif path.startswith("/api/industry/"):
+                    module,_,ident=path.removeprefix("/api/industry/").partition("/")
+                    result=view_industry(db,module,account,ident)
                 elif path.startswith("/api/document/"):
                     result=document(db,path.removeprefix("/api/document/"))
                 elif path.startswith("/api/bom/"):
                     result=bom_detail(db,path.removeprefix("/api/bom/"))
+                elif path.startswith("/api/item/"):
+                    result=item_detail(db,path.removeprefix("/api/item/"))
                 elif path=="/api/trace":
                     query=parse_qs(parsed.query)
                     result=trace(db,query.get("lot",[""])[0],query.get("code",[""])[0][:221],account)

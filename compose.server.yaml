@@ -1,0 +1,43 @@
+services:
+  db:
+    image: docker.io/library/postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: erp
+      POSTGRES_USER: erp
+      POSTGRES_PASSWORD: ${ERP_DB_PASSWORD:?请在 .env 设置数据库密码}
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U erp -d erp"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+  app:
+    image: ${ERP_IMAGE:-ghcr.io/kinsanka/wuxu-erp:main}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ERP_POSTGRES: "1"
+      PGHOST: db
+      PGDATABASE: erp
+      PGUSER: erp
+      PGPASSWORD: ${ERP_DB_PASSWORD:?请在 .env 设置数据库密码}
+      ERP_DEMO: ${ERP_DEMO:-1}
+      ERP_DEMO_LOGIN: ${ERP_DEMO_LOGIN:-}
+      ERP_ADMIN_PASSWORD: ${ERP_ADMIN_PASSWORD:-}
+      ERP_SECURE_COOKIE: ${ERP_SECURE_COOKIE:-0}
+      ERP_TIMEZONE: ${ERP_TIMEZONE:-Asia/Shanghai}
+      ERP_HOST: 0.0.0.0
+      ERP_PORT: "8080"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "${ERP_BIND:-127.0.0.1}:${ERP_PORT:-8787}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=4).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 10

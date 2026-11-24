@@ -16,16 +16,20 @@ const rights = {
   master:["planner"], purchase:["planner"], sale:["planner"], approve:["planner"], receive:["warehouse"],
   ship:["warehouse"], bom:["planner"], work:["planner"], start:["planner"], report:["planner"], finish:["planner"],
   inspect:["warehouse"], transfer:["warehouse","clinical"], use:["clinical"], billing:["clinical"], user:[],
+  link_supply:["planner"], assign_step:["planner"],
 };
 const navigation = [
   ["运营", [["home","工作台","⌂"],["purchase","采购管理","↙"],["sale","销售履约","↗"],["exercise","急单协同演练","▣"]]],
-  ["制造与医疗", [["work","生产与 BOM","▦"],["stock","库存与质检","◇"],["clinical","医院耗材","✚"],["trace","批次追溯","◎"]]],
+  ["制造与库存", [["work","生产与 BOM","▦"],["stock","库存与质检","◇"],["counts","库存盘点","▤"],["trace","批次追溯","◎"]]],
+  ["履约协同", [["transport","运输与签收","→"],["people","人员与工时","◫"],["finance","应收应付","¥"]]],
+  ["医院", [["clinical","医院耗材","✚"]]],
   ["管理", [["master","主数据","≡"],["reports","报表与审计","▤"],["users","账号管理","☷"]]],
 ];
 const pages = Object.fromEntries(navigation.flatMap(([,entries])=>entries.map(([id,label])=>[id,label])));
 const filterDefaults = {status:"", site:"", q:""};
 let state = null;
 let demo = false;
+let demoAccount = null;
 let page = "home";
 let stockTab = "stock";
 let masterTab = "items";
@@ -47,9 +51,17 @@ const code = value => `<span class="ref">${html(value)}</span>`;
 const numeric = value => `<span class="num">${html(value)}</span>`;
 const bold = value => `<span class="strong">${html(value)}</span>`;
 const item = (name, reference) => bold(name) + sub(reference);
-const allowed = action => state?.account.role === "admin" || (rights[action] || []).includes(state?.account.role);
+const allowed = action => {
+  const account=state?.account;
+  if (account?.is_demo && ["user","password"].includes(action)) return false;
+  return account?.role === "admin" || (rights[action] || []).includes(account?.role);
+};
 const hasClinical = () => ["admin","clinical"].includes(state?.account.role);
-const showNav = id => id !== "users" || allowed("user");
+const showNav = id => {
+  if (id==="users") return allowed("user");
+  if (Object.hasOwn(industryRoles,id)) return state?.account.role==="admin" || industryRoles[id].includes(state?.account.role);
+  return true;
+};
 
 function button(label,action,value="",style="") {
   return `<button type="button" class="button ${html(style)}" data-action="${html(action)}" data-value="${html(value)}">${html(label)}</button>`;
@@ -121,9 +133,10 @@ function docsTable(records,withKind=false) {
   ]);
 }
 
-function recentMovement(records) {
+function recentMovement(records,linkDocuments=true) {
   return table(["业务","物料／批次","仓库","变动","单据","时间"],records,row=>[
-    bold(row.kind),item(row.item_name,row.lot),text(row.site_name),numeric((row.quantity>0?"+":"")+qty(row.quantity)+" "+row.unit),code(row.ref),text(timestamp(row.created)),
+    bold(row.kind),item(row.item_name,row.lot),text(row.site_name),numeric((row.quantity>0?"+":"")+qty(row.quantity)+" "+row.unit),
+    linkDocuments&&row.doc_id?link(row.ref,"document",row.doc_id):code(row.ref),text(timestamp(row.created)),
   ]);
 }
 
@@ -145,18 +158,19 @@ function notices(records,render) {
 
 function homePage() {
   const model=state.summary;
-  const open=model.open_orders;
+  const open=model.factory_open;
   const cards = [
     metric("待收货采购",open.purchase||0,"已审核或待收货","purchase","↙"),
     metric("执行中工单",open.work||0,"待领料或生产中","work","▦","blue"),
-    metric("待检批次",model.inspect_count,"待检与隔离","inspection","◇","amber","goStock"),
-    hasClinical() ? metric("临床待对账",model.billing_count,"待回执或退回","clinical","✚","blue") : metric("待发货销售",open.sale||0,"已审核或待发货","sale","↗","blue"),
+    metric("待检在库批次",model.factory_pending,"待质检放行","inspection","◇","amber","goStock"),
+    metric("待发货销售",open.sale||0,"已审核或部分发货","sale","↗","blue"),
   ].join("");
   const expiry=notices(model.expiry.slice(0,5),row=>`<div class="notice-row"><div>${link(row.name,"lotTrace",row.lot_id)}${sub(row.site_name+" · "+row.lot)}</div>${cfgLabel({e:[row.days_left<0?`过期 ${Math.abs(row.days_left)} 天`:`剩余 ${row.days_left} 天`,row.days_left<0?"red":"amber"]},"e")}</div>`);
   const low=notices(model.low.slice(0,5),row=>`<div class="notice-row"><div>${bold(row.name)}${sub(row.code+" · 补货点 "+qty(row.minimum)+" "+row.unit)}</div>${numeric(qty(row.available)+" "+row.unit)}</div>`);
-  return head("运营总览","查看采购、生产、库存与临床耗材的待办和预警。",
-      allowed("purchase")?button("＋ 新建采购单","newTrade","purchase","primary"):"")
-    + `<div class="metrics">${cards}</div><div class="board"><div class="stack">${panel("最近单据",docsTable(model.recent,true))}${panel("最近出入库",recentMovement(state.movements.slice(0,6)),button("库存流水","goStock","movements","small"))}</div><div class="stack">${panel("60 天效期预警",expiry,button("查看库存","goStock","stock","small"))}${panel("低于补货点",low,"","按全仓可用批次汇总")}</div></div>`;
+  return head("工业运营总览","追踪工厂仓的采购、生产、质检与销售交付。",
+      (walkthrough?"":button("开始实操演示","walkthroughStart","","primary"))
+      +(allowed("purchase")?button("＋ 新建采购单","newTrade","purchase"):""))
+    + `<div class="metrics">${cards}</div><div class="board"><div class="stack">${panel("交期待办",docsTable(model.factory_due,true),"","工厂仓开放单据，按计划日期排序")}${panel("最近单据",docsTable(model.recent,true))}${panel("最近出入库",recentMovement(state.movements.slice(0,6)),button("库存流水","goStock","movements","small"))}</div><div class="stack">${panel("60 天效期预警",expiry,button("查看库存","goStock","stock","small"))}${panel("低于补货点",low,"","按全仓可用批次汇总")}${hasClinical()?panel("医院耗材",`<p class="empty">${number.format(model.billing_count)} 笔待对账或退回记录</p>`,button("进入耗材工作台","go","clinical","small")):""}</div></div>`;
 }
 
 function workPage() {
@@ -177,8 +191,12 @@ function stockPage() {
   let body, params={};
   if (stockTab==="stock") {
     const stocks=state.stock.filter(row=>matches(row.code,row.name,row.lot,row.site_name) && (!filter.site||filter.site===row.site_id) && (!filter.status||filter.status===row.status));
-    body=table(["物料","仓库","批次","库存","效期","状态"],stocks,row=>[
-      item(row.name,row.code),text(row.site_name),link(row.lot,"lotTrace",row.lot_id),numeric(qty(row.quantity)+" "+row.unit),dateText(row),cfgLabel(lotStatus,row.status),
+    const countAllowed=showNav("counts");
+    body=table(["物料","仓库","批次","实物在库","可用库存","效期","质检状态",...(countAllowed?["盘点"]:[])],stocks,row=>[
+      item(row.name,row.code),text(row.site_name),link(row.lot,"lotTrace",row.lot_id),unitQuantity(row.quantity,row.unit),
+      unitQuantity(row.status==="released"&&!isExpired(row)?row.quantity:0,row.unit),dateText(row),cfgLabel(lotStatus,row.status),
+      ...(countAllowed?[row.type!=="medical"&&state.sites.some(site=>site.id===row.site_id&&site.type==="factory")
+        ?button("盘点","inventoryCount",row.lot_id+"|"+row.site_id,"small"):"—"]:[]),
     ]);
     params={status:pairs(lotStatus,x=>x[0]),sites:true,actions:exportLink("导出库存","stock")};
   } else if (stockTab==="inspection") {
@@ -233,7 +251,7 @@ function masterPage() {
   const selected = state[masterTab].filter(row=>matches(row.code,row.name,row.type));
   let view;
   if (masterTab==="items") view = table(["物料","分类","单位","补货点","入库质检","一码一物","GTIN"],selected,row=>[
-    item(row.name,row.code),text(kindText[row.type]),text(row.unit),numeric(qty(row.minimum)),text(row.quality ? "需要":"—"),text(row.tracked?"启用":"—"),code(row.gtin||"—"),
+    link(row.name,"itemDetail",row.id)+sub(row.code),text(kindText[row.type]),text(row.unit),numeric(qty(row.minimum)),text(row.quality ? "需要":"—"),text(row.tracked?"启用":"—"),code(row.gtin||"—"),
   ]);
   if (masterTab==="sites") view = table(["仓库","分类"],selected,row=>[item(row.name,row.code),text(kindText[row.type])]);
   if (masterTab==="partners") view = table(["往来单位","分类","联系信息"],selected,row=>[item(row.name,row.code),text(kindText[row.type]),clean(row.contact)]);
@@ -265,13 +283,16 @@ function usersPage() {
     ]));
 }
 
-const renderers={home:homePage,exercise:exercisePage,purchase:()=>docsPage("purchase"),sale:()=>docsPage("sale"),work:workPage,stock:stockPage,clinical:clinicalPage,trace:tracePage,master:masterPage,reports:reportsPage,users:usersPage};
+const renderers={home:homePage,exercise:exercisePage,purchase:()=>docsPage("purchase"),sale:()=>docsPage("sale"),work:workPage,stock:stockPage,clinical:clinicalPage,trace:tracePage,master:masterPage,reports:reportsPage,users:usersPage,
+  transport:()=>industryPage("transport"),people:()=>industryPage("people"),finance:()=>industryPage("finance"),counts:()=>industryPage("counts")};
 
 function render() {
   $("crumb").textContent=pages[page];
   $("business-date").textContent=state.today;
   $("mode").hidden=!demo;
-  $("account").innerHTML=`<span class="avatar">${html(state.account.name.slice(0,1))}</span><span>${html(state.account.name)}<small>${html(roleText[state.account.role])}</small></span>`;
+  $("account").innerHTML=`<span class="avatar">${html(state.account.name.slice(0,1))}</span><span>${html(state.account.name)}<small>${html(state.account.is_demo?"演示账号":roleText[state.account.role])}</small></span>`;
+  $("account").disabled=!!state.account.is_demo;
+  $("account").title=state.account.is_demo?"演示账号":"更改密码";
   $("nav").innerHTML=navigation.map(([label,entries])=>`<div class="nav-label">${html(label)}</div>${entries.filter(([id])=>showNav(id)).map(([id,name,icon])=>
     `<button type="button" class="nav-item ${page===id?"active":""}" data-action="go" data-value="${id}"${page===id?' aria-current="page"':""}><span class="nav-icon" aria-hidden="true">${html(icon)}</span>${html(name)}</button>`
   ).join("")}`).join("");
@@ -287,14 +308,14 @@ function updateFiltered() {
   target.innerHTML=template.content.querySelector("#filtered").innerHTML;
 }
 
-function go(id) {
+function go(id,search="") {
   if (!Object.hasOwn(pages,id) || !showNav(id)) return;
   if (page==="exercise" && id!=="exercise") {
     if (exerciseDemoLoading) stopExerciseDemo();
     else pauseExerciseDemo();
   }
   page=id;
-  filter={...filterDefaults};
+  filter={...filterDefaults,q:search};
   $("sidebar").classList.remove("open");
   $("navigation-toggle").setAttribute("aria-expanded","false");
   render();
@@ -340,6 +361,8 @@ async function loadState() {
 
 function showLogin() {
   stopExerciseDemo();
+  endWalkthrough();
+  for (const module of Object.keys(industryViews)) delete industryViews[module];
   state=null;
   traceRecord=null;
   exerciseModel=null;
@@ -349,11 +372,20 @@ function showLogin() {
   $("starting").hidden=true;
   $("app").hidden=true;
   $("login-screen").hidden=false;
-  $("login-error").hidden=true;
-  $("demo-fill").hidden=!demo;
   if ($("dialog").open) $("dialog").close();
-  $("login-form").reset();
-  $("login-form").elements.username.focus();
+  const form=$("login-form");
+  form.reset();
+  const {username,password}=form.elements;
+  $("login-error").hidden=true;
+  $("login-title").textContent=demoAccount?"登录演示工作台":"登录工作台";
+  username.readOnly=password.readOnly=!!demoAccount;
+  if (demoAccount) {
+    username.value=demoAccount.username;
+    password.value=demoAccount.password;
+    form.querySelector('button[type="submit"]').focus();
+  } else {
+    username.focus();
+  }
 }
 
 function input(name,label,{type="text",value="",required=true,placeholder="",min="",max="",maxlength=120,step=""}={}) {
@@ -420,6 +452,8 @@ function formDialog(title,action,body,submit="保存",collect=values=>values,onS
     try {
       await loadState();
       if (page==="trace" && (traceQuery.lot || traceQuery.code)) await refreshTrace();
+      if (Object.hasOwn(industryRoles,page)) await loadIndustry(page);
+      await refreshWalkthroughProgress();
       if (onSuccess) await onSuccess(result);
     } catch (error) {
       if (error.status===401) showLogin();
@@ -495,7 +529,7 @@ async function openBOM(id) {
   const model=await request("/api/bom/"+encodeURIComponent(id));
   if (version!==dialogGeneration) return;
   const bom=state.boms.find(row=>row.id===id);
-  openDialog("物料清单 · "+(bom?.name||model.version),
+  openGuidedDetail("物料清单 · "+(bom?.name||model.version),
     `<div class="detail-meta">版本 ${html(model.version)} · ${html(timestamp(model.created))}</div>`
     + section("组件",table(["物料","单位成品用量"],model.lines,row=>[item(row.name,row.code),numeric(qty(row.quantity)+" "+row.unit)]))
     + section("工序",table(["顺序","工序名称"],model.steps,row=>[numeric(row.step_no),text(row.name)])));
@@ -516,14 +550,14 @@ function newMaster(entity) {
     "保存资料",values=>({...values,entity,quality:values.quality==="1",tracked:values.tracked==="1"}));
 }
 
-async function openDocument(id) {
+async function openDocument(id, isCurrent=()=>true) {
   const version=++dialogGeneration;
   const model=await request("/api/document/"+encodeURIComponent(id));
-  if (version!==dialogGeneration) return;
+  if (version!==dialogGeneration || !isCurrent()) return;
   const reviewable=["draft","approved"].includes(model.status);
   const tradable=model.kind!=="work" && ["approved","partial"].includes(model.status);
   const action=model.kind==="purchase"?"receive":"ship";
-  const header=`<div class="detail-meta">${cfgLabel(docStatus,model.status)}<span>${html(model.site_name)}</span>${model.partner_name?`<span>${html(model.partner_name)}</span>`:""}<span>计划日期 ${clean(model.due)}</span>${model.version?`<span>BOM ${html(model.version)}</span>`:""}</div>`;
+  const header=`<div class="detail-meta">${cfgLabel(docStatus,model.status)}<span>${html(model.site_name)}</span>${model.partner_name?`<span>${html(model.partner_name)}</span>`:""}<span>计划日期 ${clean(model.due)}</span>${model.version?link("BOM "+model.version,"bomDetail",model.bom_id):""}</div>`;
   const actions=[];
   if (reviewable && allowed("approve")) {
     if (model.status==="draft") actions.push(button("审核通过","review",id,"primary"));
@@ -540,19 +574,31 @@ async function openDocument(id) {
   const sections=[];
   if (model.note) sections.push(`<p class="detail-note">${html(model.note)}</p>`);
   sections.push(lines);
-  if (work && model.plan.length) sections.push(section("单阶缺料试算",help("按当前工单计算，库存未按其他订单预留。预计在途包含到期日内以及未登记到期日的已审核采购。")
-    + table(["组件","需求","当前可用","预计在途","当前缺料","预计净缺料"],model.plan,row=>[
-      item(row.name,row.code),numeric(qty(row.required)),numeric(qty(row.available)),numeric(qty(row.incoming)),numeric(qty(row.shortage)),numeric(qty(row.net)),
+  if (work && model.plan.length) sections.push(section("单阶缺料试算",help("基于当前仓库的可用库存试算。预计净缺扣除工单日期窗口内的计划采购量，实际领料以收货放行后的可用量为准。")
+    + table(["组件","需求","当前可用","窗口内计划采购","当前缺料","预计净缺料"],model.plan,row=>[
+      item(row.name,row.code),unitQuantity(row.required,row.unit),unitQuantity(row.available,row.unit),unitQuantity(row.incoming,row.unit),
+      unitQuantity(row.shortage,row.unit),unitQuantity(row.net,row.unit),
     ])));
+  if (work && model.plan.some(row=>row.shortage>0)) {
+    const sources=model.plan.filter(row=>row.shortage>0).flatMap(row=>row.purchases.map(source=>({...source,name:row.name,unit:row.unit})));
+    const schedules={scheduled:["窗口内计划","green"],late:["晚于工单","amber"],overdue:["采购逾期","red"],undated:["待确认日期","amber"]};
+    sections.push(section("缺料采购单",table(["组件","采购单","供应商","待收量","计划到货","交期判断"],sources,row=>[
+      bold(row.name),link(row.ref,"document",row.id),text(row.supplier),unitQuantity(row.remaining,row.unit),clean(row.due),cfgLabel(schedules,row.schedule),
+    ],"暂无同仓、已审核且有未收余量的采购单。")));
+  }
   if (work && model.steps.length) {
     const next=model.steps.find(row=>row.minutes===null)?.id;
-    sections.push(section("工序报工",table(["工序","工时","记录人","处理"],model.steps,row=>[
-      bold(row.step_no+" · "+row.name),row.minutes===null?"—":text(row.minutes+" 分钟"),clean(row.actor),
-      row.id===next&&model.status==="running"&&allowed("report")?button("报工","reportStep",id+"|"+row.id,"small"):"—",
+    sections.push(section("工序派工与报工",table(["工序","派工人员","实报工时","记录人","处理"],model.steps,row=>[
+      bold(row.step_no+" · "+row.name),row.person?item(row.person,row.person_code):"—",row.minutes===null?"—":text(row.minutes+" 分钟"),clean(row.actor),
+      `<div class="actions">${row.minutes===null&&["draft","approved","running"].includes(model.status)&&allowed("assign_step")?button(row.person?"调整派工":"派工","assignStep",id+"|"+row.id,"small"):""}
+        ${row.id===next&&model.status==="running"&&allowed("report")?button("报工","reportStep",id+"|"+row.id,"small"):""}</div>`,
     ])));
   }
-  if (model.movements.length) sections.push(section("库存流水",recentMovement(model.movements)));
-  openDialog(kindText[model.kind]+" · "+model.ref,header
+  if (model.kind==="sale") sections.push(salesProgress(model));
+  if (model.kind==="purchase") sections.push(purchaseProgress(model));
+  if (model.linked.length || ((work || model.kind==="sale") && allowed("link_supply") && model.status!=="cancelled")) sections.push(supplyChain(model));
+  if (model.movements.length) sections.push(section("库存流水",recentMovement(model.movements,false)));
+  openGuidedDetail(kindText[model.kind]+" · "+model.ref,header
     +(actions.length?`<div class="actions">${actions.join("")}</div>`:"")+sections.join(""));
 }
 
@@ -563,7 +609,8 @@ async function tradeLine(kind,serial) {
   if (!line) throw new Error("单据行不存在");
   const receive=kind==="receive";
   const available=line.quantity-line.fulfilled;
-  const receiveFields=receive?input("lot","收货批号",{maxlength:64})+input("expiry","效期",{type:"date",required:line.type==="medical",min:state.today}):"";
+  const demoLot=walkthrough?.targets.run_id&&walkthrough.targets.purchase.id===id?walkthrough.targets.code+"-RM01":"";
+  const receiveFields=receive?input("lot","收货批号",{maxlength:64,value:demoLot})+input("expiry","效期",{type:"date",required:line.type==="medical",min:state.today}):"";
   const codes=receive&&line.tracked?memo("codes","包装码（一行一码）",true,"扫描枪或手动输入，每件一个唯一包装码",12000):"";
   formDialog((receive?"采购收货":"销售发货")+" · "+line.name,kind,
     help("待处理 "+qty(available)+" "+line.unit+(receive?"":"。将优先使用近期到期的已放行批次。"))
@@ -590,7 +637,8 @@ function reportStep(serial) {
 }
 
 function finishWork(id) {
-  formDialog("生产完工","finish",grid(input("lot","新成品批号",{maxlength:64})+input("expiry","效期",{type:"date",min:state.today,required:false}))+memo()+help("完工后成品进入待检状态，需放行后才可发货。"),
+  const demoLot=walkthrough?.targets.run_id&&walkthrough.targets.work.id===id?walkthrough.targets.code+"-FG01":"";
+  formDialog("生产完工","finish",grid(input("lot","新成品批号",{maxlength:64,value:demoLot})+input("expiry","效期",{type:"date",min:state.today,required:false}))+memo()+help("完工后成品进入待检状态，需放行后才可发货。"),
     "提交完工",values=>({...values,id}),()=>openDocument(id),id);
 }
 
@@ -656,9 +704,10 @@ function passwordForm() {
     "更改密码");
 }
 
-async function searchTrace(query) {
+async function searchTrace(query, isCurrent=()=>true) {
   const requested={...query};
   const model=await request("/api/trace?"+new URLSearchParams(requested).toString());
+  if (!isCurrent()) return;
   traceRecord=model;
   traceQuery=requested;
   if ($("dialog").open) $("dialog").close();
@@ -685,7 +734,15 @@ function tab(name,value) {
 const handlers = {
   ...exerciseHandlers,
   ...exerciseDemoHandlers,
-  go:async id=>{go(id);if(id==="exercise"&&page===id) await loadExercise();},goStock:tab=>{stockTab=tab;go("stock");},
+  ...walkthroughHandlers,
+  ...industryHandlers,
+  go:async id=>{
+    if (!showNav(id)) return;
+    if ($("dialog").open) $("dialog").close();
+    go(id);
+    if (id==="exercise") await loadExercise();
+    if (Object.hasOwn(industryRoles,id)) await loadIndustry(id);
+  },goStock:tab=>{stockTab=tab;go("stock");},
   workTab:value=>tab("workTab",value),stockTab:value=>tab("stockTab",value),masterTab:value=>tab("masterTab",value),
   newTrade,newBom:newBOM,newWork,newMaster,newUser,document:openDocument,bomDetail:openBOM,
   receive:value=>tradeLine("receive",value),ship:value=>tradeLine("ship",value),
@@ -733,6 +790,8 @@ $("refresh").addEventListener("click",async ()=>{
     await loadState();
     if (page==="trace"&&traceRecord) await refreshTrace();
     if (page==="exercise") await loadExercise();
+    if (Object.hasOwn(industryRoles,page)) await loadIndustry(page);
+    await refreshWalkthroughProgress();
     notify("数据已刷新");
   } catch (error) {failure(error);}
 });
@@ -741,15 +800,12 @@ $("navigation-toggle").addEventListener("click",()=>{
   $("navigation-toggle").setAttribute("aria-expanded",String(open));
 });
 $("logout").addEventListener("click",()=>request("/api/logout",{}).then(showLogin).catch(failure));
-$("demo-fill").addEventListener("click",()=>{
-  const fields=$("login-form").elements;
-  fields.username.value="admin";
-  fields.username.focus();
-});
+
 $("login-form").addEventListener("submit",async event=>{
   event.preventDefault();
   const form=event.currentTarget;
   const button=form.querySelector('button[type="submit"]');
+  if (button.disabled) return;
   button.disabled=true;
   $("login-error").hidden=true;
   try {
@@ -759,11 +815,15 @@ $("login-form").addEventListener("submit",async event=>{
   } catch (error) {
     $("login-error").textContent=error.message;
     $("login-error").hidden=false;
-  } finally {button.disabled=false;}
+  } finally {
+    button.disabled=false;
+  }
 });
 (async ()=>{
   try {
-    demo=(await request("/api/meta")).demo;
+    const meta=await request("/api/meta");
+    demo=meta.demo;
+    demoAccount=meta.demo_account||null;
     await loadState();
   } catch (error) {
     if (error.status===401) showLogin();

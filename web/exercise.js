@@ -79,7 +79,8 @@ function exercisePage() {
     text(row.day),bold(row.event),code(row.ref),text(row.detail),text(row.actor),
   ]);
   return head("急单协同演练",`${ref} · 模拟日期 ${model.day} · 每个账号保存独立演练进度`,
-    button("自动演示","exerciseOpenDemo","","primary")+button("调整日期与门禁","exerciseAdjust")+button("重置演练","exerciseReset","","danger")) + overview
+    (walkthrough?"":button("开始实操演示","walkthroughStart","","primary"))
+    +button("自动演示","exerciseOpenDemo")+button("调整日期与门禁","exerciseAdjust")+button("重置演练","exerciseReset","","danger")) + overview
     + `<div class="stack">${panel("订单齐套与异常",warnings+materials,"",`当前版本 ${model.version} / 信用${model.credit?"已放行":"未放行"} / 日产能 ${model.capacity || "待确认"}`)}
     ${panel("采购供给",supply,"","ASN 只记在途，GR 实收后，待检数量仍不可锁料。")}
     ${panel("交付方案与承诺",plan+section("当前承诺执行",promised)+section("承诺版本历史",versions),"","分批或改期须登记客户确认凭证。客户原要求和首版承诺保留。")}

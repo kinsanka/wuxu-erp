@@ -3,5 +3,6 @@
 .github
 **/__pycache__
 *.sqlite3*
+postgres-data/
 tests/
 *.md

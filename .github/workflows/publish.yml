@@ -35,6 +35,7 @@ jobs:
           import secrets
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              print("ERP_DEMO_LOGIN=1", file=env)
               for name in ("ERP_ADMIN_PASSWORD", "ERP_DB_PASSWORD"):
                   value = secrets.token_urlsafe(24)
                   print("::add-mask::" + value)
@@ -47,7 +48,6 @@ jobs:
           python3 - <<'PY'
           import http.cookiejar
           import json
-          import os
           import urllib.request
 
           root = "http://127.0.0.1:8787"
@@ -56,13 +56,23 @@ jobs:
           )
           with client.open(root + "/api/health", timeout=10) as response:
               assert json.load(response) == {"ok": True, "db": "postgresql"}
-          credentials = json.dumps({"username": "admin", "password": os.environ["ERP_ADMIN_PASSWORD"]}).encode()
+          with client.open(root + "/api/meta", timeout=10) as response:
+              assert response.headers["Cache-Control"] == "no-store"
+              meta = json.load(response)
+          assert meta["demo_login"]
+          credentials = meta["demo_account"]
+          assert credentials["username"] == "admin"
           login = urllib.request.Request(
-              root + "/api/login", data=credentials,
+              root + "/api/login", data=json.dumps(credentials).encode(),
               headers={"Content-Type": "application/json"},
           )
           with client.open(login, timeout=10) as response:
-              assert json.load(response)["ok"]
+              assert response.headers["Cache-Control"] == "no-store"
+              assert json.load(response) == {"ok": True}
+          with client.open(root + "/api/state", timeout=10) as response:
+              assert json.load(response)["account"]["is_demo"]
+          with client.open(root + "/api/walkthrough", timeout=10) as response:
+              assert json.load(response)["practice_allowed"]
           with client.open(root + "/api/exercise/demo", timeout=10) as response:
               demo = json.load(response)
           assert demo["ref"] == "SO-SIM-001"
@@ -82,8 +92,8 @@ jobs:
           trap 'docker logout ghcr.io >/dev/null' EXIT
           docker tag "$ERP_IMAGE" "$revision"
           docker push "$revision"
-          ERP_IMAGE="$revision" docker compose pull app
-          ERP_IMAGE="$revision" docker compose up -d --no-build --wait --wait-timeout 180
+          ERP_IMAGE="$revision" docker compose -f compose.server.yaml pull app
+          ERP_IMAGE="$revision" docker compose -f compose.server.yaml up -d --wait --wait-timeout 180
           docker tag "$revision" "$image:main"
           docker push "$image:main"
 

@@ -101,3 +101,73 @@ CREATE TABLE IF NOT EXISTS order_exercises (
   revision BIGINT NOT NULL CHECK(revision>=0),
   snapshot TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS supply_links (
+  demand_id TEXT NOT NULL REFERENCES documents(id), supply_id TEXT NOT NULL REFERENCES documents(id),
+  created TEXT NOT NULL, PRIMARY KEY(demand_id,supply_id), CHECK(demand_id<>supply_id)
+);
+CREATE TABLE IF NOT EXISTS personnel (
+  id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL, team TEXT NOT NULL,
+  active INTEGER NOT NULL CHECK(active IN (0,1))
+);
+CREATE TABLE IF NOT EXISTS work_assignments (
+  doc_id TEXT NOT NULL REFERENCES documents(id), step_id TEXT NOT NULL REFERENCES bom_steps(id),
+  person_id TEXT NOT NULL REFERENCES personnel(id), created TEXT NOT NULL, PRIMARY KEY(doc_id,step_id)
+);
+CREATE TABLE IF NOT EXISTS shipments (
+  id TEXT PRIMARY KEY, ref TEXT NOT NULL UNIQUE, doc_id TEXT NOT NULL REFERENCES documents(id),
+  carrier TEXT NOT NULL, tracking TEXT NOT NULL, due TEXT NOT NULL, dispatched TEXT NOT NULL,
+  signed TEXT, receipt TEXT, UNIQUE(carrier,tracking)
+);
+CREATE TABLE IF NOT EXISTS shipment_movements (
+  shipment_id TEXT NOT NULL REFERENCES shipments(id), movement_id TEXT PRIMARY KEY REFERENCES movements(id)
+);
+CREATE TABLE IF NOT EXISTS trade_invoices (
+  id TEXT PRIMARY KEY, ref TEXT NOT NULL, direction TEXT NOT NULL CHECK(direction IN ('ar','ap')),
+  doc_id TEXT NOT NULL REFERENCES documents(id),
+  due TEXT NOT NULL, created TEXT NOT NULL, UNIQUE(direction,ref)
+);
+CREATE TABLE IF NOT EXISTS trade_invoice_lines (
+  invoice_id TEXT NOT NULL REFERENCES trade_invoices(id), line_id TEXT NOT NULL REFERENCES document_lines(id),
+  quantity BIGINT NOT NULL CHECK(quantity>0), price BIGINT NOT NULL CHECK(price>=0),
+  amount BIGINT NOT NULL CHECK(amount>0), PRIMARY KEY(invoice_id,line_id)
+);
+CREATE TABLE IF NOT EXISTS trade_settlements (
+  id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL REFERENCES trade_invoices(id), ref TEXT NOT NULL,
+  amount BIGINT NOT NULL CHECK(amount>0), created TEXT NOT NULL, UNIQUE(invoice_id,ref)
+);
+CREATE TABLE IF NOT EXISTS accepted_receipts (
+  movement_id TEXT PRIMARY KEY REFERENCES movements(id), accepted TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS purchase_returns (
+  movement_id TEXT PRIMARY KEY REFERENCES movements(id), receipt_id TEXT NOT NULL REFERENCES movements(id),
+  ref TEXT NOT NULL UNIQUE, quantity BIGINT NOT NULL CHECK(quantity>0)
+);
+CREATE INDEX IF NOT EXISTS purchase_returns_receipt_idx ON purchase_returns(receipt_id);
+CREATE TABLE IF NOT EXISTS trade_payments (
+  id TEXT PRIMARY KEY, ref TEXT NOT NULL, direction TEXT NOT NULL CHECK(direction IN ('ar','ap')),
+  partner_id TEXT NOT NULL REFERENCES partners(id), amount BIGINT NOT NULL CHECK(amount>0),
+  transacted TEXT NOT NULL, created TEXT NOT NULL, UNIQUE(direction,ref)
+);
+CREATE TABLE IF NOT EXISTS payment_allocations (
+  settlement_id TEXT PRIMARY KEY REFERENCES trade_settlements(id), payment_id TEXT NOT NULL REFERENCES trade_payments(id)
+);
+CREATE INDEX IF NOT EXISTS payment_allocations_payment_idx ON payment_allocations(payment_id);
+CREATE TABLE IF NOT EXISTS inventory_counts (
+  id TEXT PRIMARY KEY, ref TEXT NOT NULL UNIQUE, site_id TEXT NOT NULL REFERENCES sites(id),
+  lot_id TEXT NOT NULL REFERENCES lots(id), book BIGINT NOT NULL CHECK(book>=0),
+  counted BIGINT NOT NULL CHECK(counted>=0), reason TEXT NOT NULL, actor TEXT NOT NULL, created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS supply_links_source_idx ON supply_links(supply_id);
+CREATE INDEX IF NOT EXISTS work_assignments_person_idx ON work_assignments(person_id);
+CREATE INDEX IF NOT EXISTS shipments_doc_idx ON shipments(doc_id);
+CREATE INDEX IF NOT EXISTS shipment_movements_shipment_idx ON shipment_movements(shipment_id);
+CREATE INDEX IF NOT EXISTS trade_invoice_lines_source_idx ON trade_invoice_lines(line_id);
+CREATE TABLE IF NOT EXISTS practice_runs (
+  id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL REFERENCES users(id),
+  site_id TEXT NOT NULL UNIQUE REFERENCES sites(id), product_id TEXT NOT NULL UNIQUE REFERENCES items(id),
+  raw_id TEXT NOT NULL UNIQUE REFERENCES items(id), sale_id TEXT NOT NULL UNIQUE REFERENCES documents(id),
+  purchase_id TEXT NOT NULL UNIQUE REFERENCES documents(id), work_id TEXT NOT NULL UNIQUE REFERENCES documents(id),
+  created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS practice_runs_user_idx ON practice_runs(user_id,created);

@@ -30,6 +30,7 @@ services:
       PGUSER: erp
       PGPASSWORD: ${ERP_DB_PASSWORD:?请在 .env 设置数据库密码}
       ERP_DEMO: ${ERP_DEMO:-1}
+      ERP_DEMO_LOGIN: ${ERP_DEMO_LOGIN:-}
       ERP_ADMIN_PASSWORD: ${ERP_ADMIN_PASSWORD:-}
       ERP_SECURE_COOKIE: ${ERP_SECURE_COOKIE:-0}
       ERP_TIMEZONE: ${ERP_TIMEZONE:-Asia/Shanghai}

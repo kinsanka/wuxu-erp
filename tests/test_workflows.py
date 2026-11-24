@@ -40,6 +40,7 @@ class WorkflowTests(unittest.TestCase):
         self.directory=tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.admin_password=secrets.token_urlsafe(24)
+        self.enterContext(patch("erp.DEMO_LOGIN",False))
         mode=patch.dict(os.environ,{"ERP_SQLITE":str(Path(self.directory.name)/"erp.sqlite3"),
                                     "ERP_ADMIN_PASSWORD":self.admin_password})
         mode.start()
@@ -227,6 +228,88 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.request("/api/logout",{},cookie=session)[0],200)
         self.assertEqual(self.request("/api/state",cookie=session)[0],401)
 
+    @patch("erp.DEMO_LOGIN",True)
+    def test_prefilled_demo_login_reuses_admin_without_account_management(self):
+        admin_credentials={"username":"admin","password":self.admin_password}
+        with patch("erp.DEMO_LOGIN",False):
+            _,headers,_=self.request("/api/login",admin_credentials)
+        admin_session=headers["Set-Cookie"].split(";",1)[0]
+        meta=json.loads(self.request("/api/meta")[2])
+        self.assertTrue(meta["demo_login"])
+        demo_credentials=meta["demo_account"]
+        self.assertEqual(demo_credentials["username"],"admin")
+        self.assertNotEqual(demo_credentials["password"],self.admin_password)
+        self.assertEqual(self.row("SELECT COUNT(*) AS n FROM users")["n"],1)
+        self.assertEqual(self.request("/api/demo-credentials")[0],401)
+        self.assertEqual(self.request("/api/state",cookie=admin_session)[0],401)
+        self.assertEqual(self.request("/api/login",admin_credentials)[0],401)
+        self.assertEqual(self.request("/api/login",demo_credentials,origin="https://foreign.test")[0],403)
+        status,headers,body=self.request("/api/login",demo_credentials,origin="http://erp.test")
+        self.assertEqual(status,200)
+        self.assertEqual(headers["Cache-Control"],"no-store")
+        self.assertIn("HttpOnly",headers["Set-Cookie"])
+        self.assertEqual(json.loads(body),{"ok":True})
+        session=headers["Set-Cookie"].split(";",1)[0]
+        status,_,body=self.request("/api/state",cookie=session)
+        self.assertEqual(status,200)
+        state=json.loads(body)
+        self.assertTrue(state["account"]["is_demo"])
+        self.assertEqual(state["account"]["username"],"admin")
+        self.assertEqual(state["users"],[])
+        self.assertEqual(self.request("/api/exercise/demo",cookie=session)[0],200)
+        self.assertTrue(json.loads(self.request("/api/walkthrough",cookie=session)[2])["practice_allowed"])
+        self.assertEqual(self.request("/api/action/practice",{},cookie=session)[0],200)
+        self.assertEqual(self.request("/api/action/user",{},cookie=session)[0],403)
+        self.assertEqual(self.request("/api/action/password",{},cookie=session)[0],403)
+        payload=dict(entity="partners",code="V-SHARED",name="演示流程供应商",type="vendor")
+        self.assertEqual(self.request("/api/action/master",payload,cookie=session)[0],200)
+        with patch("erp.DEMO_LOGIN",False):
+            meta=json.loads(self.request("/api/meta")[2])
+            self.assertFalse(meta["demo_login"])
+            self.assertNotIn("demo_account",meta)
+            self.assertEqual(self.request("/api/login",demo_credentials)[0],401)
+            self.assertEqual(self.request("/api/state",cookie=session)[0],401)
+            admin_state=json.loads(self.request("/api/state",cookie=admin_session)[2])
+            self.assertIn("V-SHARED",{partner["code"] for partner in admin_state["partners"]})
+        self.assertEqual(self.request("/api/logout",{},cookie=session)[0],200)
+        self.assertEqual(self.request("/api/state",cookie=session)[0],401)
+        _,headers,_=self.request("/api/login",demo_credentials)
+        session=headers["Set-Cookie"].split(";",1)[0]
+        with transaction(True) as db:
+            db.execute("UPDATE settings SET value='0' WHERE key='demo'")
+        self.assertFalse(json.loads(self.request("/api/meta")[2])["demo_login"])
+        self.assertNotIn("demo_account",json.loads(self.request("/api/meta")[2]))
+        self.assertEqual(self.request("/api/login",demo_credentials)[0],401)
+        self.assertEqual(self.request("/api/state",cookie=session)[0],401)
+
+    def test_bootstrap_demo_needs_no_configured_admin_password(self):
+        empty=Path(self.directory.name)/"demo.sqlite3"
+        with patch.dict(os.environ,{"ERP_SQLITE":str(empty),"ERP_ADMIN_PASSWORD":""}), patch("erp.DEMO_LOGIN",True):
+            with transaction(True) as db:
+                initialize(db)
+                bootstrap(db)
+            self.assertEqual(self.row("SELECT COUNT(*) AS n FROM users")["n"],1)
+            demo_credentials=json.loads(self.request("/api/meta")[2])["demo_account"]
+            self.assertEqual(self.request("/api/login",demo_credentials)[0],200)
+
+    def test_walkthrough_links_to_existing_erp_records(self):
+        self.assertEqual(self.request("/api/walkthrough")[0],401)
+        _,headers,_=self.request("/api/login",{"username":"admin","password":self.admin_password})
+        session=headers["Set-Cookie"].split(";",1)[0]
+        status,_,body=self.request("/api/walkthrough",cookie=session)
+        self.assertEqual(status,200)
+        targets=json.loads(body)
+        for kind in ("sale","purchase","work"):
+            status,_,body=self.request("/api/document/"+targets[kind]["id"],cookie=session)
+            self.assertEqual(status,200)
+            model=json.loads(body)
+            self.assertEqual(model["kind"],kind)
+            if kind=="work":
+                self.assertIn(targets["batch"]["code"],{row["lot"] for row in model["movements"]})
+        status,_,body=self.request("/api/trace?lot="+targets["batch"]["id"],cookie=session)
+        self.assertEqual(status,200)
+        self.assertIn("AL-DEMO-01",{row["code"] for row in json.loads(body)["upstream"]})
+
     def test_http_retry_does_not_repeat_partial_receipt(self):
         order,line=self.purchase("al",count="20")
         _,headers,_=self.request("/api/login",{"username":"admin","password":self.admin_password})
@@ -254,12 +337,13 @@ class WorkflowTests(unittest.TestCase):
 
     def test_restart_does_not_reseed(self):
         self.action("use",code="SPD-A002",case_ref="PERSIST-01")
-        with patch.dict(os.environ, {"ERP_ADMIN_PASSWORD": ""}):
+        with patch.dict(os.environ, {"ERP_ADMIN_PASSWORD": ""}), patch("seed.SEED_EXAMPLES",False):
             with transaction(True) as db:
                 initialize(db)
                 bootstrap(db)
         row=self.row("SELECT COUNT(*) AS n FROM clinical WHERE case_ref='PERSIST-01'")
         self.assertEqual(row["n"],1)
+        self.assertTrue(json.loads(self.request("/api/meta")[2])["demo"])
         status,_,_=self.request("/api/login",{"username":"admin","password":self.admin_password})
         self.assertEqual(status,200)
 

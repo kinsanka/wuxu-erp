@@ -70,6 +70,10 @@ nav { overflow: auto; padding: 7px 13px 20px; flex: 1; }
 .path, .top-actions { display: flex; align-items: center; gap: 13px; white-space: nowrap; }
 .path span, .path b, .business-date { color: var(--subtle); font-weight: 500; }
 .path strong { font-weight: 670; }
+.walkthrough { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 9px 16px; padding: 10px 28px; border-bottom: 1px solid var(--border); background: var(--green-soft); }
+.walkthrough-copy p { color: var(--muted); font-size: 12px; line-height: 1.55; margin-top: 2px; }
+#walkthrough { position: sticky; top: 61px; z-index: 2; }
+#dialog-walkthrough { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px; padding: 9px 12px; }
 .mode { border: 1px solid #e6d9ae; background: #fcf5e3; color: #765723; padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 650; display: inline-flex; align-items: center; gap: 6px; }
 .mode i, .status i { width: 6px; height: 6px; display: inline-block; background: currentColor; border-radius: 50%; }
 #navigation-toggle { display: none; }
@@ -87,6 +91,7 @@ main { max-width: 1650px; margin: 0 auto; padding: 28px; outline: none; }
 .button.small { font-size: 12px; min-height: 29px; padding: 4px 8px; }
 .icon-button { width: 35px; min-height: 35px; padding: 0; font-size: 19px; }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 13px; margin-bottom: 16px; }
+.industry-metrics { grid-template-columns: repeat(3,minmax(0,1fr)); }
 .metric { display: block; padding: 16px; background: white; border: 1px solid var(--border); border-radius: var(--radius); text-align: left; color: var(--ink); width: 100%; }
 .metric:hover { border-color: #8eae9d; }
 .metric-top { display: flex; align-items: center; justify-content: space-between; gap: 9px; font-size: 13px; }
@@ -158,11 +163,13 @@ dialog::backdrop { background: #10252099; }
 .detail-note { margin-bottom: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .detail-section { margin-top: 14px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .detail-section h3 { padding: 10px 12px; font-size: 13px; }
+.detail-section > .form-hint { margin: 0 12px 10px; }
+.document-section-actions { padding: 10px 12px; }
 .toast { position: fixed; z-index: 10; right: 18px; bottom: 18px; max-width: min(420px,calc(100vw - 36px)); border-radius: 8px; box-shadow: 0 4px 24px #15291e25; color: white; background: #235b4b; padding: 12px 15px; overflow-wrap: anywhere; }
 .toast.error { background: #923d30; }
 @media (max-width: 1080px) {
   .layout { grid-template-columns: 190px minmax(0,1fr); }
-  main, .topbar { padding-inline: 20px; }
+  main, .topbar, #walkthrough { padding-inline: 20px; }
   .board { grid-template-columns: minmax(0,1fr); }
   .board > .stack { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
@@ -172,8 +179,9 @@ dialog::backdrop { background: #10252099; }
   .sidebar { position: fixed; inset: 56px auto 0 0; height: auto; width: min(260px,85vw); z-index: 5; transform: translateX(-102%); transition: transform .16s ease; box-shadow: 8px 0 35px #182f2a30; }
   .sidebar.open { transform: translateX(0); }
   .sidebar .brand { padding-block: 17px; }
-  main, .topbar { padding-inline: 12px; }
+  main, .topbar, #walkthrough { padding-inline: 12px; }
   .topbar { min-height: 56px; }
+  #walkthrough { top: 56px; }
   main { padding-top: 17px; }
   .page-head { align-items: flex-start; flex-direction: column; gap: 10px; }
   .path span, .path b, .business-date { display: none; }

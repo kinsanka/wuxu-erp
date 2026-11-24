@@ -8,6 +8,8 @@
   <link rel="stylesheet" href="/style.css">
   <script defer src="/exercise_demo.js"></script>
   <script defer src="/exercise.js"></script>
+  <script defer src="/walkthrough.js"></script>
+  <script defer src="/industry.js"></script>
   <script defer src="/app.js"></script>
 </head>
 <body>
@@ -19,12 +21,11 @@
     </div>
     <div class="login-content">
       <form id="login-form">
-        <h2>登录工作台</h2>
+        <h2 id="login-title">登录工作台</h2>
         <label>账号<input name="username" autocomplete="username" required></label>
         <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
         <p id="login-error" class="form-error" role="alert" hidden></p>
         <button type="submit" class="button primary">登录 <span aria-hidden="true">→</span></button>
-        <button id="demo-fill" type="button" class="button soft" hidden>填入演示用户名</button>
       </form>
     </div>
   </section>
@@ -42,6 +43,7 @@
         <div class="path"><button id="navigation-toggle" class="button icon-button" type="button" aria-label="展开业务导航" aria-expanded="false">☰</button><span>运营工作台</span><b aria-hidden="true">/</b><strong id="crumb"></strong></div>
         <div class="top-actions"><span id="mode" class="mode" hidden><i></i>演示数据</span><span id="business-date" class="business-date"></span><button id="refresh" type="button" class="button icon-button" aria-label="刷新数据" title="刷新数据">↻</button></div>
       </header>
+      <section id="walkthrough" class="walkthrough" aria-label="逐步演示" hidden></section>
       <main id="main" tabindex="-1"></main>
     </div>
   </div>
